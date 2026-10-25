@@ -5,3 +5,5 @@ integrations/FreeDeepseekAPI/
 .env.*
 deepseek-auth.json
 auth.json
+.tmp/
+examples/*/node_modules/

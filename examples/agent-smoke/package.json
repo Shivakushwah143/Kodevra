@@ -1,0 +1,10 @@
+{
+  "name": "agent-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Disposable project used to verify that the Kodevra agent can read, edit and test real files.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
