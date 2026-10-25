@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+@theme {
+  /* Palette: near-black base, off-white text, one restrained cyan accent. */
+  --color-ink: #08090b;
+  --color-surface: #0d0f12;
+  --color-raised: #13161b;
+  --color-line: #1c2026;
+  --color-line-strong: #272c34;
+  --color-fg: #e7e9ec;
+  --color-muted: #8b929c;
+  --color-accent: #4cc2ff;
+  --color-accent-strong: #65ccff;
+  --color-pass: #57d08f;
+  --color-fail: #ff7a66;
+  --color-warn: #f2b45e;
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+  /* Keep anchor targets clear of the sticky navbar. */
+  scroll-padding-top: 5rem;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-ink);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* clip (not hidden) so the sticky navbar keeps working. */
+  overflow-x: clip;
+}
+
+::selection {
+  background: rgba(76, 194, 255, 0.28);
+  color: var(--color-fg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Minimal cursor for the terminal demo. */
+@keyframes cursor-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.cursor-block {
+  animation: cursor-blink 1.05s step-end infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .cursor-block {
+    animation: none;
+    opacity: 1;
+  }
+}

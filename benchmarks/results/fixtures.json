@@ -1,0 +1,145 @@
+{
+  "checked_at": "2026-10-25T11:46:43.019Z",
+  "tasks": [
+    {
+      "task": "01-cart-total",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "02-range-sum",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "03-rename-currency",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "04-users-handler",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "05-signup-validation",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "06-extract-validator",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "07-retry-wrapper",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "08-parse-duration",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "09-rate-limiter",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "10-map-limit",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "11-average-consumers",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "12-csv-fields",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "13-add-days",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "14-multi-key-sort",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "15-title-case",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "16-traffic-light",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "17-lru-cache",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "18-paginate",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "19-escape-html",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "20-argv-parser",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    }
+  ]
+}
