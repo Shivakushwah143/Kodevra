@@ -3,8 +3,9 @@ import { motion, useInView, useReducedMotion } from "framer-motion";
 import { Check } from "lucide-react";
 
 import { terminalScript, type TerminalLine, type TerminalPhase } from "../data/site";
+import { BrandMark } from "./BrandMark";
 
-const LINE_INTERVAL = 0.16; // seconds between revealed lines
+const LINE_INTERVAL = 0.15; // seconds between revealed lines
 const START_DELAY = 0.35;
 
 const chipStyles: Record<TerminalPhase, { label: string; className: string }> = {
@@ -21,24 +22,22 @@ function lineDelay(index: number) {
 function lineClass(kind: TerminalLine["kind"]) {
   switch (kind) {
     case "meta":
-      return "text-fg";
     case "command":
+    case "plain":
       return "text-fg";
     case "muted":
-      return "text-muted";
     case "edit-heading":
       return "text-muted";
     case "file":
       return "text-accent";
     case "fail":
+    case "diff-del":
       return "text-fail";
     case "pass":
+    case "zero":
+    case "diff-add":
       return "text-pass";
-    case "result":
-      return "text-fg";
-    case "status":
-      return "";
-    case "gap":
+    default:
       return "";
   }
 }
@@ -61,8 +60,7 @@ export function TerminalDemo() {
     terminalScript.forEach((line, index) => {
       const next = "phase" in line ? line.phase : undefined;
       if (!next) return;
-      const timer = window.setTimeout(() => setPhase(next), lineDelay(index) * 1000);
-      timers.push(timer);
+      timers.push(window.setTimeout(() => setPhase(next), lineDelay(index) * 1000));
     });
 
     return () => timers.forEach(window.clearTimeout);
@@ -77,10 +75,8 @@ export function TerminalDemo() {
     >
       {/* Panel header */}
       <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-        <span className="font-mono text-[11px] tracking-[0.16em] text-muted">
-          <span aria-hidden="true" className="text-accent">
-            ◆
-          </span>{" "}
+        <span className="inline-flex items-center gap-2 font-mono text-[11px] tracking-[0.16em] text-muted">
+          <BrandMark size={13} className="text-accent" />
           KODEVRA
         </span>
         <motion.span
@@ -101,8 +97,8 @@ export function TerminalDemo() {
           <motion.div
             key={index}
             initial={reduceMotion ? false : { opacity: 0 }}
-            animate={inView ? { opacity: 1 } : { opacity: 0 }}
-            transition={{ duration: 0.28, delay: reduceMotion || !inView ? 0 : lineDelay(index) }}
+            animate={reduceMotion || inView ? { opacity: 1 } : { opacity: 0 }}
+            transition={{ duration: 0.28, delay: !reduceMotion && inView ? lineDelay(index) : 0 }}
             className={lineClass(line.kind)}
           >
             <TerminalLineView line={line} showCursor={animated && index === 4 && phase === "running"} />
@@ -127,35 +123,49 @@ function TerminalLineView({ line, showCursor }: { line: TerminalLine; showCursor
     case "command":
       return (
         <div className="whitespace-pre-wrap break-words">
-          <span className="text-accent">></span> {line.text}
+          <span className="text-accent">{'>'}</span> {line.text}
           {showCursor && (
-            <span aria-hidden="true" className="cursor-block ml-0.5 inline-block h-[1em] w-[0.5em] translate-y-[0.15em] bg-accent" />
+            <span
+              aria-hidden="true"
+              className="cursor-block ml-0.5 inline-block h-[1em] w-[0.5em] translate-y-[0.15em] bg-accent"
+            />
           )}
         </div>
       );
+    case "plain":
+      return <div className="whitespace-pre-wrap">{line.text}</div>;
     case "edit-heading":
       return <div className="text-muted">{line.text}</div>;
     case "file":
       return <div className="break-all pl-4">{line.text}</div>;
     case "fail":
       return (
-        <div className="text-fail">
-          <span aria-hidden="true">✕ </span>
+        <div>
+          <span aria-hidden="true">{'\u2715'} </span>
           {line.text}
         </div>
       );
     case "pass":
       return (
-        <div className="text-pass">
-          <span aria-hidden="true">✓ </span>
+        <div>
+          <span aria-hidden="true">{'\u2713'} </span>
           {line.text}
         </div>
       );
-    case "result":
+    case "zero":
+      return <div>{line.text}</div>;
+    case "diff-del":
       return (
-        <div className="whitespace-pre-wrap">
-          {line.command} <span className="text-muted">→</span>{" "}
-          <span className="text-pass">{line.status}</span>
+        <div className="whitespace-pre-wrap break-words">
+          <span aria-hidden="true">- </span>
+          {line.text}
+        </div>
+      );
+    case "diff-add":
+      return (
+        <div className="whitespace-pre-wrap break-words">
+          <span aria-hidden="true">+ </span>
+          {line.text}
         </div>
       );
     case "status":

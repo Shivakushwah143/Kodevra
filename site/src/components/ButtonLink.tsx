@@ -7,6 +7,8 @@ type ButtonLinkProps = {
   size?: "sm" | "md";
   className?: string;
   ariaLabel?: string;
+  /** When provided, intercepts the anchor and runs the action instead (e.g. opens the waitlist modal). */
+  onClick?: () => void;
 };
 
 const base =
@@ -29,9 +31,22 @@ export function ButtonLink({
   size = "md",
   className = "",
   ariaLabel,
+  onClick,
 }: ButtonLinkProps) {
   return (
-    <a href={href} aria-label={ariaLabel} className={`${base} ${variants[variant]} ${sizes[size]} ${className}`}>
+    <a
+      href={href}
+      aria-label={ariaLabel}
+      onClick={
+        onClick
+          ? (event) => {
+              event.preventDefault();
+              onClick();
+            }
+          : undefined
+      }
+      className={`${base} ${variants[variant]} ${sizes[size]} ${className}`}
+    >
       {children}
     </a>
   );

@@ -1,8 +1,11 @@
 import { ACCESS_HREF } from "../data/site";
+import { useAccess } from "./AccessModal";
 import { ButtonLink } from "./ButtonLink";
 import { Reveal, Section, container } from "./Section";
 
 export function FinalCTA() {
+  const { open } = useAccess();
+
   return (
     <Section id="early-access" labelledBy="final-cta-heading" className="py-24 sm:py-32">
       <div className={`flex flex-col items-center text-center ${container}`}>
@@ -12,17 +15,19 @@ export function FinalCTA() {
             className="text-[clamp(2rem,5vw,3.5rem)] font-semibold leading-[1.08] tracking-[-0.03em]"
           >
             Give it the task.
-            <br />
+            <br />{" "}
             Get back verified code.
           </h2>
-          <p className="mx-auto mt-6 max-w-[48ch] text-lg text-muted">
-            Kodevra handles the work between the request and the result.
+          <p className="mx-auto mt-6 max-w-[52ch] text-lg text-muted">
+            From request to working code, with execution and verification in between.
           </p>
         </Reveal>
 
         <Reveal delay={0.12}>
           <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
-            <ButtonLink href={ACCESS_HREF}>Get Early Access</ButtonLink>
+            <ButtonLink href={ACCESS_HREF} onClick={() => open("Free")}>
+              Get Early Access
+            </ButtonLink>
             <ButtonLink href="#product" variant="secondary">
               Explore the Product
             </ButtonLink>

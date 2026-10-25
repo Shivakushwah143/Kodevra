@@ -1,15 +1,20 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { Menu, X } from "lucide-react";
 
 import { navLinks, ACCESS_HREF } from "../data/site";
+import { useAccess } from "./AccessModal";
 import { ButtonLink } from "./ButtonLink";
+import { Wordmark } from "./BrandMark";
 import { container } from "./Section";
 
 export function Navbar() {
   const [scrolled, setScrolled] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const wasOpen = useRef(false);
   const reduceMotion = useReducedMotion();
+  const { open } = useAccess();
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 8);
@@ -27,22 +32,37 @@ export function Navbar() {
     return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen]);
 
+  // When the menu closes, keyboard focus must not be dropped to <body>:
+  // return it to the toggle so the next Tab continues from the navbar.
+  // Deferred one task so it runs after the browser's own focus fixup for the
+  // unmounted menu link, which would otherwise win the race.
+  useEffect(() => {
+    if (!menuOpen) {
+      const wasOpenNow = wasOpen.current;
+      wasOpen.current = false;
+      if (!wasOpenNow) return;
+      const timer = window.setTimeout(() => {
+        const active = document.activeElement;
+        if (!active || active === document.body || !active.isConnected) {
+          toggleRef.current?.focus();
+        }
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    wasOpen.current = true;
+  }, [menuOpen]);
+
+  const requestAccess = () => open("Free");
+
   return (
     <header
       className={`sticky top-0 z-50 transition-colors duration-200 ${
-        scrolled ? "border-b border-line bg-ink/85 backdrop-blur-md" : "border-b border-transparent"
+        scrolled ? "border-b border-line bg-ink/80 backdrop-blur" : "border-b border-transparent"
       }`}
     >
       <div className={`flex h-16 items-center justify-between ${container}`}>
-        <a
-          href="#product"
-          className="font-mono text-[13px] font-semibold tracking-[0.18em] text-fg"
-          aria-label="Kodevra home"
-        >
-          <span aria-hidden="true" className="text-accent">
-            ◆
-          </span>{" "}
-          KODEVRA
+        <a href="#product" aria-label="Kodevra home">
+          <Wordmark />
         </a>
 
         <nav aria-label="Primary" className="hidden items-center gap-7 md:flex">
@@ -58,10 +78,16 @@ export function Navbar() {
         </nav>
 
         <div className="flex items-center gap-3">
-          <ButtonLink href={ACCESS_HREF} size="sm" className="hidden md:inline-flex">
+          <ButtonLink
+            href={ACCESS_HREF}
+            size="sm"
+            className="hidden md:inline-flex"
+            onClick={requestAccess}
+          >
             Get Early Access
           </ButtonLink>
           <button
+            ref={toggleRef}
             type="button"
             onClick={() => setMenuOpen((open) => !open)}
             aria-expanded={menuOpen}
@@ -100,6 +126,7 @@ export function Navbar() {
                 href={ACCESS_HREF}
                 className="mt-3 w-full"
                 ariaLabel="Get Early Access"
+                onClick={requestAccess}
               >
                 Get Early Access
               </ButtonLink>
