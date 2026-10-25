@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node bin/kodevra.js",
+    "test": "node --test test/*.test.js",
     "doctor": "node bin/kodevra.js doctor",
-    "smoke": "node bin/kodevra.js run --workspace examples/agent-smoke \"Run npm test, fix the failing implementation, and re-run until it passes.\""
+    "smoke": "node bin/kodevra.js run --workspace examples/agent-smoke --verify \"npm test\" \"Find the failing test, fix the implementation in src/slugify.js without touching the test, then stop.\""
   },
   "engines": {
     "node": ">=20"

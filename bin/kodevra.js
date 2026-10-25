@@ -10,8 +10,17 @@ import {
   DEFAULT_PROVIDER,
   ensureDefaultProvider,
   ensureModelLimit,
+  providerEntry,
   readConfig,
 } from "../lib/config.js";
+import { streamEngine } from "../lib/engine.js";
+import { classifyFailure, describeFailure } from "../lib/failures.js";
+import { writePermissionOverlay } from "../lib/permissions.js";
+import { createVerificationAuthorization, authorizationDrift, renewAuthorization } from "../lib/authorization.js";
+import { listExecutors, resolveExecutor } from "../lib/executors.js";
+import { createRunLog } from "../lib/events.js";
+import { installSandboxTool } from "../lib/sandbox-tool.js";
+import { failureSignature, repairPrompt, resultLines, workspaceChanges } from "../lib/verify.js";
 import { findExecutable, runDiagnostics } from "../lib/doctor.js";
 import {
   credentialFile,
@@ -37,7 +46,10 @@ import {
 
 const USAGE = `${color.bold("Usage")}
   kodevra [path]              start the agent in a workspace (default: current directory)
-  kodevra run "<task>"        run one task headlessly (tool permissions auto-approved)
+  kodevra run "<task>"        run one task headlessly (workspace-write by default)
+  kodevra run "<task>" --verify "npm test"
+                              run a task, then let a real command decide PASS/FAIL
+  kodevra sessions            list the local sessions for this workspace
   kodevra doctor              check engine, provider, model, auth, proxy and workspace
   kodevra init                apply Kodevra defaults (DeepSeek provider, Gemini output cap)
   kodevra providers           list providers, credentials and default models
@@ -51,8 +63,20 @@ ${color.bold("Options")}
   -w, --workspace <path>      workspace to run in
   -p, --provider <key>        provider for this run (default: ${DEFAULT_PROVIDER})
   -m, --model <provider/model>  default: ${DEFAULT_PROVIDER}/${DEFAULT_MODEL_ID}
-      --agent <name>          OpenCode agent to use (default: build)
-      --auto, --no-auto       auto-approve tool permissions
+      --agent <name>          OpenCode agent to use (default: build, or plan in read-only)
+      --mode <mode>           read-only | ask | workspace-write
+                              (default: workspace-write for run, ask for launch)
+      --verify <command>      run this command after the task; its exit code decides PASS/FAIL
+      --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
+  -c, --continue              continue the last session
+  -s, --session <id>          continue a specific session
+      --executor <name>       where project commands run: host | docker (default: host)
+                              docker also enables the trusted sandbox_exec tool for the agent
+      --reapprove             renew host-execution authorization when the agent changed
+                              verification scripts, tests or their configuration
+      --events-json           stream structured execution events to stderr
+      --auto, --no-auto       auto-approve permissions on an interactive launch
+                              (ignored for run: unattended runs never auto-approve)
       --headless              use the headless OAuth method (openai only)
       --no-doctor             skip startup diagnostics
   -h, --help                  show this help
@@ -70,8 +94,50 @@ ${color.bold("Environment")}
   KODEVRA_STATE               path to Kodevra's provider selection state
 `;
 
-const VALUE_FLAGS = new Set(["-w", "--workspace", "-m", "--model", "-p", "--provider", "--agent"]);
-const COMMANDS = new Set(["doctor", "init", "run", "help", "version", "launch", "providers", "auth"]);
+const VALUE_FLAGS = new Set([
+  "-w",
+  "--workspace",
+  "-m",
+  "--model",
+  "-p",
+  "--provider",
+  "--agent",
+  "--mode",
+  "--verify",
+  "--max-repairs",
+  "-s",
+  "--session",
+  "--executor",
+]);
+const COMMANDS = new Set([
+  "doctor",
+  "init",
+  "run",
+  "help",
+  "version",
+  "launch",
+  "providers",
+  "auth",
+  "sessions",
+]);
+
+/**
+ * Automation modes (FRD FR-017). They map onto what OpenCode already enforces:
+ * the read-only `plan` agent, the normal build agent, and its approval flag.
+ * Kodevra does not implement its own permission engine.
+ */
+const MODES = {
+  "read-only": { agent: "plan", description: "no file edits" },
+  ask: { agent: "build", description: "edits require approval" },
+  "workspace-write": { agent: "build", description: "workspace edits allowed" },
+};
+
+/** Only an interactive launch may auto-approve. Unattended runs never do. */
+function modeAuto(opts, name) {
+  if (opts.command !== "launch") return false;
+  if (opts.autoExplicit) return opts.auto;
+  return name === "workspace-write";
+}
 
 function parse(argv) {
   const opts = {
@@ -85,6 +151,14 @@ function parse(argv) {
     doctor: true,
     help: false,
     headless: false,
+    mode: null,
+    verify: null,
+    maxRepairs: 2,
+    session: null,
+    continueSession: false,
+    executor: "host",
+    reapprove: false,
+    eventsJson: false,
     passthrough: [],
     message: [],
   };
@@ -132,6 +206,14 @@ function parse(argv) {
       opts.auto = false;
       opts.autoExplicit = true;
     } else if (arg === "--headless") opts.headless = true;
+    else if (arg === "--mode") opts.mode = argv[(index += 1)];
+    else if (arg === "--verify") opts.verify = argv[(index += 1)];
+    else if (arg === "--max-repairs") opts.maxRepairs = Number(argv[(index += 1)]);
+    else if (arg === "-s" || arg === "--session") opts.session = argv[(index += 1)];
+    else if (arg === "-c" || arg === "--continue") opts.continueSession = true;
+    else if (arg === "--executor") opts.executor = argv[(index += 1)] || "host";
+    else if (arg === "--reapprove") opts.reapprove = true;
+    else if (arg === "--events-json") opts.eventsJson = true;
     else if (arg === "--no-doctor") opts.doctor = false;
     else if (arg === "--") {
       opts.passthrough.push(...argv.slice(index + 1));
@@ -163,40 +245,386 @@ function quoteForShell(value) {
   return /[\s"]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 
-function changedFiles(workspace) {
-  const result = spawnSync("git", ["status", "--porcelain"], {
-    cwd: workspace,
-    encoding: "utf8",
-    timeout: 10000,
-  });
-  if (result.error || result.status !== 0) return null;
-  return result.stdout
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => line.slice(3).trim());
+function resolveMode(opts) {
+  const name = (opts.mode || (opts.command === "run" ? "workspace-write" : "ask")).toLowerCase();
+  const mode = MODES[name];
+  if (!mode) {
+    throw new Error(`Unknown mode "${name}". Use: ${Object.keys(MODES).join(" | ")}`);
+  }
+  if (name === "read-only" && opts.agent && opts.agent !== "plan") {
+    throw new Error(`--mode read-only runs the plan agent; --agent ${opts.agent} would allow edits. Drop --agent or use --mode workspace-write.`);
+  }
+  return {
+    name,
+    description: mode.description,
+    agent: opts.agent || mode.agent,
+    auto: modeAuto(opts, name),
+  };
 }
 
-function printSummary({ workspace, model, startedAt, exitCode }) {
-  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-  const files = changedFiles(workspace);
-  console.log("");
-  console.log(
-    `  ${color.dim("done ")} ${exitCode === 0 ? color.green("exit 0") : color.red(`exit ${exitCode}`)} · ${seconds}s`,
-  );
-  console.log(`  ${color.dim("model")} ${model}`);
-  if (files === null) {
-    console.log(`  ${color.dim("files")} ${color.dim("workspace is not a git repository")}`);
-  } else if (!files.length) {
-    console.log(`  ${color.dim("files")} no file changes detected`);
+function visibleArgs(args) {
+  return args
+    .filter((arg, position) => !(arg === "-m" || (position > 0 && args[position - 1] === "-m")))
+    .map((arg) => trim(arg));
+}
+
+function printFailure(failure) {
+  console.error(`\n  ${color.red("failure")} ${color.red(describeFailure(failure))}`);
+  if (failure.action) console.error(`  ${color.yellow("next")} ${failure.action}`);
+}
+
+/** Is the local proxy actually reachable? Used to classify, never to guess. */
+async function proxyReachableIfLocal(provider) {
+  if (assessProvider(provider).kind !== "local") return null;
+  const baseURL = providerEntry(readConfig().data, provider)?.options?.baseURL;
+  if (!baseURL) return null;
+  try {
+    const response = await fetch(`${baseURL.replace(/\/$/, "")}/models`, { signal: AbortSignal.timeout(3000) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A verification command may only run while the developer's authorization still
+ * matches what the command would execute. If the agent changed scripts, test
+ * files or their configuration, execution stops unless --reapprove renewed it.
+ */
+function verificationGate({ authorization, workspace, command, reapprove }) {
+  const drift = authorizationDrift(authorization, { workspace, command });
+  if (drift.ok && !drift.commandChanged) return { ok: true, drift, renewed: false, authorization };
+  if (!reapprove) return { ok: false, drift, renewed: false, authorization };
+  return { ok: true, drift, renewed: true, authorization: renewAuthorization(authorization, { workspace, command }) };
+}
+
+function printApproval(approval) {
+  console.error(`\n  ${color.red("approval required")} ${color.dim("the verification command was not executed")}`);
+  const files = [...approval.changed, ...approval.added, ...approval.removed];
+  if (files.length) console.error(`  ${color.dim("changed by agent")} ${files.join(", ")}`);
+  console.error(`  ${color.yellow("next")} re-run with --reapprove to authorize the current workspace state`);
+}
+
+async function runVerificationWithEvents({ executor, command, workspace, events, attempt }) {
+  events.emit("verification_started", {
+    command,
+    executor: executor.name,
+    sandboxed: executor.sandboxed,
+    attempt,
+  });
+  console.log(`\n  ${color.dim("verify ")} ${command}`);
+  let result;
+  try {
+    result = await executor.run(command, { cwd: workspace });
+  } catch (error) {
+    result = {
+      command,
+      ok: false,
+      status: 1,
+      timedOut: false,
+      output: error.message,
+      durationMs: 0,
+      error: error.code ?? "EXECUTOR_ERROR",
+    };
+  }
+  if (result.details?.snapshot) {
+    console.log(
+      `  ${color.dim("snapshot")} ${result.details.snapshot} ${color.dim("- source workspace was not mounted")}`,
+    );
+  }
+  events.emit("verification_finished", {
+    command,
+    executor: executor.name,
+    sandboxed: executor.sandboxed,
+    status: result.status,
+    ok: result.ok,
+    timed_out: Boolean(result.timedOut),
+    duration_ms: result.durationMs,
+    image: result.details?.image ?? null,
+    snapshot: result.details?.snapshot ?? null,
+    staged_files: result.details?.staged_files ?? null,
+    error: result.error ?? null,
+  });
+  return result;
+}
+
+function emitFileChanges(events, workspace) {
+  const changes = workspaceChanges(workspace);
+  events.emit("file_changes", {
+    files: changes.files,
+    diff: changes.stat ? changes.stat.split("\n").pop() : null,
+  });
+  return changes;
+}
+
+/**
+ * One headless task, optionally proved by a real command.
+ *
+ * Flow: engine run -> authorization check -> verification through the resolved
+ * executor -> bounded repair (new failure only) -> report. The verification
+ * command's exit code, not the model's prose, makes this PASS or FAIL. The
+ * executor is the host today and says so; it is not sandboxed.
+ */
+async function executeRun({ engine, opts, workspace, model, selection }) {
+  const startedAt = Date.now();
+  const before = workspaceChanges(workspace).files;
+  const maxRepairs = Number.isFinite(opts.maxRepairs) ? Math.max(0, Math.min(5, opts.maxRepairs)) : 2;
+  const mode = resolveMode(opts);
+
+  let executor;
+  let executorInfo = null;
+  try {
+    executor = resolveExecutor(opts.executor);
+    if (opts.verify && executor.check) executorInfo = await executor.check();
+  } catch (error) {
+    console.error(color.red(error.message));
+    if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+    console.error(`  ${color.dim("No verification ran, and Kodevra did not fall back to the host executor.")}`);
+    process.exit(2);
+  }
+
+  // Model-requested shell only exists inside the Docker sandbox. The trusted
+  // tool is installed into OpenCode's global tools directory (never the
+  // workspace, which the agent can write) and stays inert unless this run
+  // enables it through the environment below.
+  const sandboxExec = executor.name === "docker";
+  let sandboxTool = null;
+  if (sandboxExec) {
+    try {
+      sandboxTool = installSandboxTool();
+    } catch (error) {
+      console.error(color.red(error.message));
+      if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+      console.error(`  ${color.dim("No agent terminal is available, and Kodevra did not fall back to host bash.")}`);
+      process.exit(2);
+    }
+  }
+
+  const events = createRunLog({
+    workspace,
+    model,
+    provider: selection.provider,
+    mode: mode.name,
+    executor: executor.name,
+    verify: opts.verify,
+    stream: opts.eventsJson,
+  });
+
+  console.log(`${color.dim("kodevra")} ${color.dim("->")} opencode ${visibleArgs(buildArgs(opts, engineModel(selection), workspace)).join(" ")}`);
+  console.log(`${color.dim("mode   ")} ${mode.name} ${color.dim(`- ${mode.description}`)}`);
+
+  // Automated runs get an explicit workspace scope instead of --auto. With the
+  // Docker executor, native host bash is denied and sandbox_exec is the only
+  // shell the agent has; otherwise bash stays on "ask", which the engine
+  // auto-rejects when nobody can approve it.
+  const scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec });
+  if (sandboxExec) {
+    Object.assign(scope.env, {
+      KODEVRA_SANDBOX_EXEC: "1",
+      KODEVRA_HOME: path.resolve(import.meta.dirname, ".."),
+      KODEVRA_WORKSPACE: workspace,
+      KODEVRA_RUN_ID: events.runId,
+      KODEVRA_RUN_FILE: events.file ?? "",
+    });
+  }
+  if (scope.warning) {
+    console.log(`  ${color.yellow("scope  ")} ${scope.warning}`);
   } else {
-    const shown = files.slice(0, 8);
-    const more = files.length > shown.length ? ` (+${files.length - shown.length} more)` : "";
-    console.log(`  ${color.dim("files")} ${shown.join(", ")}${more}`);
+    console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; shell needs approval")}`);
+  }
+  if (opts.autoExplicit && opts.auto) {
+    console.log(`  ${color.yellow("--auto ignored")} ${color.dim("unattended runs do not auto-approve tool permissions")}`);
+  }
+
+  if (sandboxExec) {
+    console.log(
+      `  ${color.dim("tool    ")} sandbox_exec ${color.dim("->")} ${sandboxTool.file} ${color.green("docker sandbox")}`,
+    );
+  }
+
+  events.emit("run_started", {
+    workspace,
+    model,
+    provider: selection.provider,
+    mode: mode.name,
+    executor: executor.name,
+    sandboxed: executor.sandboxed,
+    image: executorInfo?.image ?? null,
+    sandbox_exec: sandboxExec,
+    verify: opts.verify ?? null,
+  });
+
+  let authorization = null;
+  if (opts.verify) {
+    authorization = createVerificationAuthorization({ workspace, command: opts.verify });
+    console.log(`  ${color.dim("executor")} ${executor.name} ${color.dim(`- ${executor.description}`)} ${executor.sandboxed ? color.green("sandboxed") : color.yellow("not sandboxed")}`);
+    if (executorInfo?.image) console.log(`  ${color.dim("image   ")} ${executorInfo.image}`);
+    console.log(
+      `  ${color.dim("gate    ")} authorized by --verify · ${authorization.files.length} verification file(s) · sha256 ${authorization.fingerprint.slice(0, 12)}`,
+    );
+    events.emit("verification_authorized", {
+      command: opts.verify,
+      fingerprint: authorization.fingerprint,
+      files: authorization.files.length,
+      source: authorization.source,
+    });
   }
   console.log("");
+
+  let run = { status: 1, signal: null, output: "", durationMs: 0 };
+  let failure = null;
+  let verification = null;
+  let repairs = 0;
+  let approval = null;
+
+  try {
+    events.emit("model_started", { attempt: 0, agent: mode.agent });
+    run = await streamEngine(engine, buildArgs(opts, engineModel(selection), workspace), {
+      cwd: workspace,
+      env: scope.env,
+    });
+    events.emit("model_finished", {
+      attempt: 0,
+      status: run.status,
+      signal: run.signal,
+      duration_ms: run.durationMs,
+    });
+
+    if (run.status !== 0) {
+      failure = classifyFailure({
+        output: run.output,
+        status: run.status,
+        signal: run.signal,
+        provider: selection.provider,
+        proxyReachable: await proxyReachableIfLocal(selection.provider),
+      });
+      printFailure(failure);
+      events.emit("failure", { code: failure.code, origin: failure.origin, message: failure.message });
+      events.emit("verification_skipped", { reason: "model execution failed" });
+    }
+    emitFileChanges(events, workspace);
+
+    if (opts.verify && !failure) {
+      let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
+      if (!gate.ok) {
+        approval = { required: true, changed: gate.drift.changed, added: gate.drift.added, removed: gate.drift.removed };
+        events.emit("approval_required", { command: opts.verify, ...approval });
+        printApproval(approval);
+      } else {
+        if (gate.renewed) {
+          authorization = gate.authorization;
+          events.emit("verification_reapproved", {
+            command: opts.verify,
+            changed: gate.drift.changed,
+            added: gate.drift.added,
+            removed: gate.drift.removed,
+            fingerprint: authorization.fingerprint,
+          });
+        }
+        verification = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt: 0 });
+        let signature = failureSignature(verification.output);
+
+        while (!verification.ok && repairs < maxRepairs) {
+          repairs += 1;
+          events.emit("repair_started", { attempt: repairs, max: maxRepairs });
+          console.log(`\n  ${color.yellow(`repair ${repairs}/${maxRepairs}`)} ${color.dim("passing the failure back to the model")}`);
+          const repairArgs = buildArgs(
+            { ...opts, continueSession: true, session: null },
+            engineModel(selection),
+            workspace,
+            { message: [repairPrompt({ command: opts.verify, result: verification, attempt: repairs, maxRepairs })] },
+          );
+          events.emit("model_started", { attempt: repairs, agent: mode.agent });
+          run = await streamEngine(engine, repairArgs, { cwd: workspace, env: scope.env });
+          events.emit("model_finished", {
+            attempt: repairs,
+            status: run.status,
+            signal: run.signal,
+            duration_ms: run.durationMs,
+          });
+          if (run.status !== 0) {
+            failure = classifyFailure({
+              output: run.output,
+              status: run.status,
+              signal: run.signal,
+              provider: selection.provider,
+              proxyReachable: await proxyReachableIfLocal(selection.provider),
+            });
+            printFailure(failure);
+            events.emit("failure", { code: failure.code, origin: failure.origin, message: failure.message });
+            break;
+          }
+          emitFileChanges(events, workspace);
+
+          gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
+          if (!gate.ok) {
+            approval = { required: true, changed: gate.drift.changed, added: gate.drift.added, removed: gate.drift.removed };
+            events.emit("approval_required", { command: opts.verify, ...approval });
+            printApproval(approval);
+            break;
+          }
+          if (gate.renewed) {
+            authorization = gate.authorization;
+            events.emit("verification_reapproved", {
+              command: opts.verify,
+              changed: gate.drift.changed,
+              added: gate.drift.added,
+              removed: gate.drift.removed,
+              fingerprint: authorization.fingerprint,
+            });
+          }
+
+          verification = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt: repairs });
+          const next = failureSignature(verification.output);
+          if (!verification.ok && next === signature) {
+            console.log(`\n  ${color.yellow("stopped")} the same failure repeated; no progress after ${repairs} repair run(s).`);
+            break;
+          }
+          signature = next;
+        }
+      }
+    }
+  } finally {
+    scope.cleanup();
+  }
+
+  const changes = workspaceChanges(workspace);
+  const preexisting = before.filter((file) => changes.files.includes(file)).length;
+  const ok = approval ? false : verification ? verification.ok && !failure : run.status === 0 && !failure;
+
+  events.emit("run_finished", {
+    ok,
+    duration_ms: Date.now() - startedAt,
+    repairs,
+    executor: executor.name,
+    sandboxed: executor.sandboxed,
+    approval_required: Boolean(approval),
+    verification: verification
+      ? { command: verification.command, ok: verification.ok, status: verification.status }
+      : null,
+    changed_files: changes.files.length,
+  });
+
+  const lines = resultLines({
+    model,
+    durationMs: Date.now() - startedAt,
+    verification,
+    repairs,
+    maxRepairs,
+    changes,
+    failure,
+    preexisting,
+    executor,
+    authorization,
+    approval: approval ? { ...approval, required: true } : null,
+    eventsFile: events.file,
+  });
+  for (const line of lines) console.log(line);
+
+  process.exit(ok ? 0 : 1);
 }
 
-function start(engine, args, workspace, { onExit } = {}) {
+function start(engine, args, workspace) {
   const commandArgs = engine.shell ? [args.map(quoteForShell).join(" ")] : args;
   const child = spawn(engine.command, commandArgs, {
     cwd: workspace,
@@ -212,29 +640,29 @@ function start(engine, args, workspace, { onExit } = {}) {
   });
 
   child.on("exit", (code, signal) => {
-    const exitCode = signal ? 1 : code ?? 0;
-    if (onExit) onExit(exitCode);
-    process.exit(exitCode);
+    process.exit(signal ? 1 : code ?? 0);
   });
 }
 
-function buildArgs(opts, model, workspace) {
-  const auto = opts.command === "run" ? (opts.autoExplicit ? opts.auto : true) : opts.auto;
+function buildArgs(opts, model, workspace, { message = opts.message } = {}) {
+  const mode = resolveMode(opts);
   const args = opts.command === "run" ? ["run"] : [];
 
   if (model) args.push("-m", model);
-  if (opts.agent) args.push("--agent", opts.agent);
-  if (auto) args.push("--auto");
+  if (mode.agent) args.push("--agent", mode.agent);
+  if (mode.auto) args.push("--auto");
+  if (opts.continueSession) args.push("--continue");
+  if (opts.session) args.push("--session", opts.session);
 
   if (opts.command === "run") {
-    if (opts.message.length) {
+    if (message.length) {
       // Keep file work anchored to the selected workspace: models otherwise tend
       // to build absolute paths from the repository root.
-      const task = `Workspace: ${workspace}. Use paths relative to this directory.\n\n${opts.message.join(" ")}`;
+      const task = `Workspace: ${workspace}. Use paths relative to this directory.\n\n${message.join(" ")}`;
       args.push(task);
     }
-  } else if (opts.message.length) {
-    args.push(...opts.message);
+  } else if (message.length) {
+    args.push(...message);
   }
   args.push(...opts.passthrough);
   return args;
@@ -550,9 +978,24 @@ async function main() {
     process.exit(2);
   }
 
+  let mode;
+  try {
+    mode = resolveMode(opts);
+  } catch (error) {
+    console.error(color.red(error.message));
+    process.exit(2);
+  }
+
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    console.error(`${color.red("Workspace not found:")} ${workspace}`);
+    console.error(`  ${color.yellow("->")} pass an existing directory: kodevra <path>`);
+    process.exit(2);
+  }
+
   const authLine = assessment.ready
     ? `${assessment.state} · ${assessment.credential.source}`
     : `${assessment.state} · ${assessment.detail}`;
+  const activeMode = opts.command === "run" || opts.command === "launch" ? `${mode.name} - ${mode.description}` : null;
 
   if (opts.command === "providers") {
     if ((opts.message[0] || "list").toLowerCase() === "list") {
@@ -570,7 +1013,21 @@ async function main() {
     return;
   }
 
-  console.log(banner({ model, workspace, engine: "opencode", auth: authLine }));
+  console.log(banner({ model, workspace, engine: "opencode", auth: authLine, mode: activeMode }));
+
+  // Sessions stay in OpenCode's own local store; Kodevra only makes them
+  // reachable from its own command surface (FRD J-06).
+  if (opts.command === "sessions") {
+    const engine = findExecutable("opencode");
+    if (!engine) {
+      console.error(color.red("OpenCode is not installed. Install it with: npm i -g opencode-ai"));
+      process.exit(1);
+    }
+    const result = await streamEngine(engine, ["session", "list"], { cwd: workspace });
+    console.log("");
+    console.log(`  ${color.dim("resume")} kodevra run -c "<task>"   ·   kodevra -c   ·   kodevra run -s <id> "<task>"`);
+    process.exit(result.status);
+  }
 
   const diagnosticsAlways = opts.command === "doctor";
   let failed = 0;
@@ -597,17 +1054,20 @@ async function main() {
     process.exit(1);
   }
 
+  if (opts.command === "run") {
+    await executeRun({ engine, opts, workspace, model, selection });
+    return;
+  }
+
+  if (opts.verify) {
+    console.error(`${color.yellow("--verify is only used by kodevra run")} ${color.dim("(the interactive session has no headless result to check)")}`);
+  }
+
   const args = buildArgs(opts, engineModel(selection), workspace);
-  const shown = args
-    .filter((arg, position) => !(arg === "-m" || (position > 0 && args[position - 1] === "-m")))
-    .map((arg) => trim(arg));
-  console.log(`${color.dim("kodevra")} ${color.dim("->")} opencode ${shown.join(" ")}`);
+  console.log(`${color.dim("kodevra")} ${color.dim("->")} opencode ${visibleArgs(args).join(" ")}`);
   console.log("");
 
-  const startedAt = Date.now();
-  start(engine, args, workspace, {
-    onExit: opts.command === "run" ? (exitCode) => printSummary({ workspace, model, startedAt, exitCode }) : undefined,
-  });
+  start(engine, args, workspace);
 }
 
 main().catch((error) => {

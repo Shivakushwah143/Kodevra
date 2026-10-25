@@ -7,3 +7,8 @@ deepseek-auth.json
 auth.json
 .tmp/
 examples/*/node_modules/
+.kodevra/
+*.tgz
+benchmarks/.work/
+benchmarks/results/raw/
+
