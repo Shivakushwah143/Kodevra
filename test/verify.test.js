@@ -14,6 +14,9 @@ import {
   workspaceChanges,
 } from "../lib/verify.js";
 
+/** The CLI colours its output on a TTY; assert on the visible text, not the escapes. */
+const stripAnsi = (text) => text.replace(/\u001b\[[0-9;]*m/g, "");
+
 test("failure signatures ignore timing and hash noise", () => {
   const a = failureSignature("Error: expected 3 got 2\n finished in 12ms\n deadbeefcafe");
   const b = failureSignature("Error: expected 3 got 2\n finished in 98ms\n 1234abcdef");
@@ -36,37 +39,43 @@ test("the repair prompt forbids faking a pass", () => {
 });
 
 test("an unverified run is reported as UNVERIFIED", () => {
-  const lines = resultLines({
-    model: "freedeepseek/deepseek-v4-flash",
-    durationMs: 1000,
-    verification: null,
-    changes: { isGit: true, files: [], stat: null },
-  }).join("\n");
+  const lines = stripAnsi(
+    resultLines({
+      model: "freedeepseek/deepseek-v4-flash",
+      durationMs: 1000,
+      verification: null,
+      changes: { isGit: true, files: [], stat: null },
+    }).join("\n"),
+  );
   assert.match(lines, /UNVERIFIED/);
   assert.match(lines, /--verify/);
   assert.doesNotMatch(lines, /PASS/);
 });
 
 test("a verified run reports the real command and exit code", () => {
-  const pass = resultLines({
-    model: "m",
-    durationMs: 10,
-    verification: { command: "npm test", ok: true, status: 0, timedOut: false },
-    repairs: 1,
-    maxRepairs: 2,
-    changes: { isGit: true, files: ["src/a.js"], stat: "1 file changed, 2 insertions(+)" },
-  }).join("\n");
+  const pass = stripAnsi(
+    resultLines({
+      model: "m",
+      durationMs: 10,
+      verification: { command: "npm test", ok: true, status: 0, timedOut: false },
+      repairs: 1,
+      maxRepairs: 2,
+      changes: { isGit: true, files: ["src/a.js"], stat: "1 file changed, 2 insertions(+)" },
+    }).join("\n"),
+  );
   assert.match(pass, /npm test -> PASS \(exit 0\)/);
   assert.match(pass, /1\/2 bounded repair/);
   assert.match(pass, /src\/a\.js/);
 
-  const fail = resultLines({
-    model: "m",
-    durationMs: 10,
-    verification: { command: "npm test", ok: false, status: 1, timedOut: false },
-    changes: { isGit: true, files: ["src/a.js"], stat: null },
-    failure: { code: "AGENT_FAILED", origin: "agent", message: "opencode exited 1 without a recognised error code.", action: "Run kodevra doctor." },
-  }).join("\n");
+  const fail = stripAnsi(
+    resultLines({
+      model: "m",
+      durationMs: 10,
+      verification: { command: "npm test", ok: false, status: 1, timedOut: false },
+      changes: { isGit: true, files: ["src/a.js"], stat: null },
+      failure: { code: "AGENT_FAILED", origin: "agent", message: "opencode exited 1 without a recognised error code.", action: "Run kodevra doctor." },
+    }).join("\n"),
+  );
   assert.match(fail, /FAIL \(exit 1\)/);
   assert.match(fail, /AGENT_FAILED/);
   assert.doesNotMatch(fail, /PASS/);

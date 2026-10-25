@@ -8,15 +8,18 @@ import { resultLines } from "../lib/verify.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 
+/** The CLI colours its output on a TTY; assert on the visible text, not the escapes. */
+const stripAnsi = (text) => text.replace(/\u001b\[[0-9;]*m/g, "");
+
 test("the startup panel carries brand, workspace, model, sandbox and mode", () => {
-  const text = header({
+  const text = stripAnsi(header({
     workspace: path.join(process.cwd(), "examples", "agent-smoke"),
     model: "freedeepseek/deepseek-v4-flash",
     provider: "DeepSeek (FreeDeepseekAPI)",
     auth: "ready · local proxy",
     sandbox: "Docker ready",
     mode: "workspace-write - workspace edits allowed",
-  });
+  }));
 
   assert.match(text, /KODEVRA/);
   assert.match(text, new RegExp(TAGLINE.replace(/\./g, "\\.")));
@@ -34,21 +37,23 @@ test("the version constant matches the package manifest", () => {
 });
 
 test("the status word is never optimistic", () => {
-  assert.match(verdict("verified"), /^VERIFIED$/);
-  assert.equal(verdict("unverified"), "UNVERIFIED");
-  assert.notEqual(verdict("unverified"), "VERIFIED");
-  assert.match(verdict("failed"), /FAILED/);
-  assert.match(verdict("refused"), /REFUSED/);
+  assert.match(stripAnsi(verdict("verified")), /^VERIFIED$/);
+  assert.equal(stripAnsi(verdict("unverified")), "UNVERIFIED");
+  assert.notEqual(stripAnsi(verdict("unverified")), "VERIFIED");
+  assert.match(stripAnsi(verdict("failed")), /FAILED/);
+  assert.match(stripAnsi(verdict("refused")), /REFUSED/);
 });
 
 test("a failed verification is reported as FAILED, not VERIFIED", () => {
-  const text = resultLines({
-    model: "m",
-    durationMs: 2000,
-    verification: { command: "npm test", ok: false, status: 2, timedOut: false },
-    sandboxCommands: 2,
-    changes: { isGit: true, files: ["src/a.js"], stat: null },
-  }).join("\n");
+  const text = stripAnsi(
+    resultLines({
+      model: "m",
+      durationMs: 2000,
+      verification: { command: "npm test", ok: false, status: 2, timedOut: false },
+      sandboxCommands: 2,
+      changes: { isGit: true, files: ["src/a.js"], stat: null },
+    }).join("\n"),
+  );
 
   assert.match(text, /Status\s+FAILED/);
   assert.doesNotMatch(text, /VERIFIED/);
