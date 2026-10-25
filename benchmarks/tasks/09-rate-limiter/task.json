@@ -1,0 +1,7 @@
+{
+  "id": "09-rate-limiter",
+  "title": "Rate limiter never expires its window",
+  "category": "backend-logic",
+  "prompt": "src/limiter.js implements createRateLimiter({ limit, windowMs, now }) but it counts every call forever, so a key stays blocked once it reaches the limit. Implement a sliding window: only allowed calls inside the last windowMs milliseconds count, blocked attempts are not recorded, and keys are tracked independently. `now` is injected, so do not call Date.now inside check(). Do not edit the tests.",
+  "verify": "npm test"
+}

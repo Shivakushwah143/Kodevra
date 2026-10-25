@@ -1,0 +1,7 @@
+{
+  "id": "15-title-case",
+  "title": "titleCase mangles small words and acronyms",
+  "category": "strings",
+  "prompt": "src/title.js lowercases every word, so acronyms collapse and small words are capitalised mid-title. Implement titleCase(text, exceptions) keeping a, an, the, of, and, or, in, on lowercase after the first word, preserving all-caps acronyms, and emitting exception words with exactly the casing supplied. Do not edit the tests.",
+  "verify": "npm test"
+}

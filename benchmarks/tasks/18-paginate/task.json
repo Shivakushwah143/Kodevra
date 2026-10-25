@@ -1,0 +1,7 @@
+{
+  "id": "18-paginate",
+  "title": "Pagination metadata is wrong and inputs are unclamped",
+  "category": "pagination",
+  "prompt": "src/paginate.js slices an array but reports the wrong page count and navigation flags, and it trusts whatever page and pageSize callers pass. Fix it so it returns the documented { items, page, pageSize, total, totalPages, hasNext, hasPrev } object: page below 1 becomes 1, pageSize is clamped to 1..100, and the flags describe the page actually served. Do not edit the tests.",
+  "verify": "npm test"
+}

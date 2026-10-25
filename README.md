@@ -8,9 +8,15 @@ FreeDeepseekAPI provides OpenAI-compatible access to DeepSeek. Kodevra adds the 
 startup diagnostics, verification reporting and a one-word command.
 
 ```
-  █▄▀ █▀█ █▀▄ █▀▀ █ █ █▀█ ▄▀█
-  █ █ █▄█ █▄▀ ██▄ ▀▄▀ █▀▄ █▀█
+  ◆ KODEVRA 0.2.0
   Your Models. Your Code. Your Agent.
+
+  Workspace  ./my-project
+  Model      freedeepseek/deepseek-v4-flash
+  Provider   DeepSeek (FreeDeepseekAPI)
+  Auth       ready · local proxy
+  Sandbox    docker ready · linux engine
+  Mode       workspace-write - workspace edits allowed
 ```
 
 ## Requirements
@@ -22,12 +28,30 @@ startup diagnostics, verification reporting and a one-word command.
 ## Install
 
 ```bash
-cd Kodevra
-npm link                        # optional: exposes the global `kodevra` command
-kodevra doctor                  # checks engine, provider, model, proxy and workspace
+npm install -g .                # from a checkout, or: npm install -g ./kodevra-0.2.0.tgz
+kodevra init                    # guided setup: detects node, engine, Docker, providers
+kodevra doctor                  # checks engine, provider, model, proxy, sandbox and workspace
+kodevra                         # launch the agent in the current directory
 ```
 
-`npm link` only needs to run once. To remove it later: `npm unlink -g kodevra`.
+`npm pack` produces a 54 kB tarball with 24 files: `bin/`, `lib/`, `tools/`, `docs/`, `README.md` and
+`THIRD_PARTY_NOTICES.md`. Tests, examples, benchmarks, credentials, sessions and runtime state are not packaged.
+The package is `private` on purpose: it installs locally but cannot be published by accident. The name `kodevra`
+is unclaimed on the public registry as of 2026-10-25, so no release has been made.
+
+### `kodevra init`
+
+First-run setup detects and then asks, in this order: Node.js version, OpenCode and its version, the operating
+system, Docker and its Linux engine, and every provider with its readiness state and the exact sign-in command.
+
+It proposes the changes it will make — adding the `freedeepseek` provider block when missing and capping
+`openrouter/google/gemini-3.6-flash` at 4096 output tokens — and applies them only after an interactive yes
+(`--yes` accepts non-interactively). Existing configuration is merged, never replaced, and a backup is written
+before any change. `kodevra init -p <provider>` selects a ready provider for future runs; if that provider is not
+ready, DeepSeek stays the default and the exact `kodevra auth login` command is printed instead.
+
+Kodevra never installs OpenCode or Docker, never asks for a password or browser cookie, and never writes a
+credential into the package or the repository.
 
 ## Launch
 
@@ -72,21 +96,32 @@ kodevra run --verify "npm test" "fix the failing slugify test"
   verify  npm test
   ... real test output ...
 
-  TASK RESULT
+  TASK COMPLETE
 
-  model        freedeepseek/deepseek-v4-flash
-  duration     24.0s
-  verification npm test -> PASS (exit 0)
-  changed      examples/agent-smoke/src/slugify.js
-  diff          1 file changed, 2 insertions(+), 1 deletion(-)
+  Files changed    1
+  Sandbox commands 2
+  Verification     npm test -> PASS (exit 0)
+  Repair attempts  none
+  Duration         24.0s
+  Model            freedeepseek/deepseek-v4-flash
+  Executor         docker - ephemeral Linux container sandboxed
+
+  Changes
+  src/slugify.js
+  1 file changed, 2 insertions(+), 1 deletion(-)
+
+  Status           VERIFIED
 ```
 
 - If the command fails, the failure output is handed back to the model and the command is re-run — at most
   `--max-repairs` times (default 2, capped at 5). The loop stops early when the same failure repeats, and it stops
   immediately if the model call itself fails.
 - Without `--verify` the result block says **UNVERIFIED**; Kodevra never turns the model's prose into a green check.
-- `changed` and `diff` are read from git in the selected workspace only, so a project inside a larger repository is
-  not credited with unrelated changes. Files already modified before the run are called out.
+  `VERIFIED` is printed only after the command actually exits 0; a failed command prints `FAILED`, an authorization
+  refusal prints `REFUSED`, and `pilot`-style prose never influences the status line.
+- `Changes` is read from git in the selected workspace only, so a project inside a larger repository is not credited
+  with unrelated changes; when git cannot speak for the workspace (an ignored or untracked directory) Kodevra falls
+  back to a file-metadata snapshot instead of reporting zero. Files already modified before the run are called out.
 - Failures are classified (`PROXY_UNAVAILABLE`, `AUTH_EXPIRED`, `RATE_LIMITED`, `MODEL_UNAVAILABLE`,
   `MALFORMED_TOOL_CALL`, `TOOL_DENIED`, `CONTEXT_EXHAUSTED`, `CANCELLED`, ...) with one next action instead of a stack
   trace. A dead local proxy is detected by probing it, not by matching log text.
@@ -290,6 +325,40 @@ and `kodevra run -p gemini-web` refuses to start. There is no one-click OAuth to
 models are `kodevra auth login google-api`, or a Gemini model through the already-credentialed `openrouter`
 provider (`-m openrouter/google/gemini-3.6-flash`, capped at 4096 output tokens by `kodevra init`).
 
+## Developer experience
+
+The launch panel is the product's identity: brand and version, workspace, model, provider, authentication
+readiness, sandbox availability, mode and the commands worth knowing. It is terminal-safe on Windows PowerShell
+(no cursor tricks, no animation) and falls back to plain text when colour is unavailable.
+
+During a run, Kodevra prints the engine's own stream plus one line per sandbox command it observes in the run's
+event file — `sandbox npm test -> exit 1 (5.9s)` — so progress is visible without a second orchestrator. The run
+finishes with `TASK COMPLETE`, a real file count, sandbox command count, verification result with exit code,
+repair attempts, duration, executor and sandbox status, the changed files and a single status word.
+
+Interactive launches keep OpenCode's terminal interface. Kodevra owns the launcher, banner, setup screen,
+diagnostics and summaries; it does not fork the engine's TUI for branding because that would mean patching
+upstream. OpenCode's own themes and configuration remain available inside the interactive session.
+
+## Benchmarks
+
+`benchmarks/` is a reproducible comparison harness: 20 Node.js tasks across bug fixing, multi-file changes, API
+implementation, validation, refactoring, error handling, test repair, backend logic, async work, dependency-aware
+changes, parsing, dates, sorting, strings, state machines, caching, pagination, security and CLI parsing.
+
+```bash
+node benchmarks/runner.js --validate   # manifests, templates, hidden tests, solutions
+node benchmarks/runner.js --check      # broken template -> failing hidden test -> solution passes
+node benchmarks/runner.js --task 01-cart-total --variant both
+node benchmarks/runner.js --summary
+```
+
+Every task ships a broken template, a hidden acceptance test that is copied in only after the agent finishes,
+and a reference solution used to prove the fixture is solvable. All 20 fixtures pass `--check` (20/20). The live
+pilot is blocked by the local proxy account entering cooldown; `benchmarks/results/summary.md` records the two
+attempted runs as infrastructure failures rather than as a model comparison, and the reasons are documented in
+`benchmarks/README.md`. Do not read it as evidence that either agent is better.
+
 ## Layout
 
 | Path | Purpose |
@@ -300,7 +369,9 @@ provider (`-m openrouter/google/gemini-3.6-flash`, capped at 4096 output tokens 
 | `lib/auth.js` | delegates sign-in to OpenCode and verifies credential presence only |
 | `lib/doctor.js` | startup diagnostics (node, engine, config, provider, model, auth, proxy, workspace) |
 | `lib/engine.js` | streams the engine, captures its tail, runs the verification command |
-| `lib/verify.js` | workspace-scoped git evidence, failure signatures, repair prompt, TASK RESULT block |
+| `lib/verify.js` | workspace-scoped git + metadata evidence, failure signatures, repair prompt, completion summary |
+| `lib/progress.js` | tails the run's JSONL events to print live sandbox command progress |
+| `lib/onboarding.js` | guided `kodevra init`: detection, provider choice, consent, safe defaults |
 | `lib/failures.js` | failure taxonomy (`PROXY_UNAVAILABLE`, `AUTH_EXPIRED`, `TOOL_DENIED`, ...) |
 | `lib/permissions.js` | workspace-scoped permission overlay for automated runs |
 | `lib/authorization.js` | verification authorization fingerprint, drift detection and renewal |
@@ -312,7 +383,8 @@ provider (`-m openrouter/google/gemini-3.6-flash`, capped at 4096 output tokens 
 | `tools/sandbox_exec.js` | the `sandbox_exec` custom tool OpenCode loads (`~/.config/opencode/tools/`) |
 | `lib/events.js` | JSONL execution events for a future branded terminal interface |
 | `lib/brand.js` | wordmark, tagline, colour |
-| `test/` | Node built-in tests for the failure taxonomy and verification reporting |
+| `benchmarks/` | 20-task comparison harness, fixtures, runner and recorded results |
+| `test/` | Node built-in tests: taxonomy, verification, sandboxing, branding, progress, onboarding |
 | `docs/IMPLEMENTATION_STATUS.md` | FRD coverage by requirement ID |
 | `AGENTS.md` | engineering instructions picked up by OpenCode's `AGENTS.md` mechanism |
 | `examples/agent-smoke` | disposable project with one failing test, used to prove the agent works |

@@ -1,0 +1,7 @@
+{
+  "id": "20-argv-parser",
+  "title": "CLI argument parser misses the common flag forms",
+  "category": "cli-parsing",
+  "prompt": "src/argv.js parses command-line arguments but only understands `--name value`, and it swallows the next token even when it is another flag. Rework parseArgv so it returns { _: positionals, flags } and supports `--name value`, `--name=value`, boolean `--verbose`, short `-v` and `-n 3`, and `--` to stop flag parsing. Do not edit the tests.",
+  "verify": "npm test"
+}

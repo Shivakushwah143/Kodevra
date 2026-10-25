@@ -1,0 +1,7 @@
+{
+  "id": "11-average-consumers",
+  "title": "Average contract change must reach both consumers",
+  "category": "dependency-aware",
+  "prompt": "src/stats.js is the single source of truth for averages, and it currently returns NaN for an empty list. Change the contract so average([]) returns 0, then remove the local empty/NaN guards in src/report.js and src/summary.js so both consumers rely on that contract. Behaviour for non-empty lists must not change, and the tests must not be edited.",
+  "verify": "npm test"
+}

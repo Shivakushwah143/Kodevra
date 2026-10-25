@@ -4,12 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { banner, color, mark, PRODUCT, VERSION } from "../lib/brand.js";
+import { banner, color, header, mark, PRODUCT, VERSION } from "../lib/brand.js";
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PROVIDER,
-  ensureDefaultProvider,
-  ensureModelLimit,
   providerEntry,
   readConfig,
 } from "../lib/config.js";
@@ -18,10 +16,20 @@ import { classifyFailure, describeFailure } from "../lib/failures.js";
 import { writePermissionOverlay } from "../lib/permissions.js";
 import { createVerificationAuthorization, authorizationDrift, renewAuthorization } from "../lib/authorization.js";
 import { listExecutors, resolveExecutor } from "../lib/executors.js";
+import { probeDocker } from "../lib/docker-executor.js";
+import { watchRunEvents } from "../lib/progress.js";
 import { createRunLog } from "../lib/events.js";
 import { installSandboxTool } from "../lib/sandbox-tool.js";
-import { failureSignature, repairPrompt, resultLines, workspaceChanges } from "../lib/verify.js";
+import {
+  failureSignature,
+  repairPrompt,
+  resultLines,
+  snapshotTree,
+  treeChangedFiles,
+  workspaceChanges,
+} from "../lib/verify.js";
 import { findExecutable, runDiagnostics } from "../lib/doctor.js";
+import { runInit } from "../lib/onboarding.js";
 import {
   credentialFile,
   credentialPresent,
@@ -30,11 +38,9 @@ import {
   resolveAuthTarget,
 } from "../lib/auth.js";
 import {
-  OPENROUTER_GEMINI_MODEL,
   PRESET_KEYS,
   activeSelection,
   assessProvider,
-  catalogModelContext,
   defaultModelFor,
   engineModel,
   fullModel,
@@ -75,6 +81,7 @@ ${color.bold("Options")}
       --reapprove             renew host-execution authorization when the agent changed
                               verification scripts, tests or their configuration
       --events-json           stream structured execution events to stderr
+  -y, --yes                   accept the setup plan without prompting (init)
       --auto, --no-auto       auto-approve permissions on an interactive launch
                               (ignored for run: unattended runs never auto-approve)
       --headless              use the headless OAuth method (openai only)
@@ -159,6 +166,7 @@ function parse(argv) {
     executor: "host",
     reapprove: false,
     eventsJson: false,
+    yes: false,
     passthrough: [],
     message: [],
   };
@@ -214,6 +222,7 @@ function parse(argv) {
     else if (arg === "--executor") opts.executor = argv[(index += 1)] || "host";
     else if (arg === "--reapprove") opts.reapprove = true;
     else if (arg === "--events-json") opts.eventsJson = true;
+    else if (arg === "-y" || arg === "--yes") opts.yes = true;
     else if (arg === "--no-doctor") opts.doctor = false;
     else if (arg === "--") {
       opts.passthrough.push(...argv.slice(index + 1));
@@ -223,6 +232,15 @@ function parse(argv) {
   }
 
   return opts;
+}
+
+/** One line of sandbox truth for the startup panel: probe only, never pull. */
+function sandboxStatusLine() {
+  if (process.env.KODEVRA_SKIP_DOCKER_PROBE === "1") return color.dim("probe skipped");
+  const probe = probeDocker();
+  return probe.ok
+    ? color.green(probe.detail)
+    : `${color.yellow("unavailable")}${color.dim(` · ${probe.detail}`)}`;
 }
 
 function printChecks(checks) {
@@ -368,6 +386,7 @@ function emitFileChanges(events, workspace) {
 async function executeRun({ engine, opts, workspace, model, selection }) {
   const startedAt = Date.now();
   const before = workspaceChanges(workspace).files;
+  const beforeTree = snapshotTree(workspace);
   const maxRepairs = Number.isFinite(opts.maxRepairs) ? Math.max(0, Math.min(5, opts.maxRepairs)) : 2;
   const mode = resolveMode(opts);
 
@@ -476,6 +495,24 @@ async function executeRun({ engine, opts, workspace, model, selection }) {
   let verification = null;
   let repairs = 0;
   let approval = null;
+  let sandboxCommands = 0;
+
+  // Sandbox commands run inside the engine's process, so Kodevra learns about
+  // them by tailing the run's own event file. No extra orchestration.
+  const stopProgress = watchRunEvents(events.file, {
+    onEvent: (event) => {
+      if (event.event === "sandbox_started") {
+        console.log(`  ${color.dim("sandbox")} ${trim(event.command, 72)} ${color.dim("running ...")}`);
+      } else if (event.event === "sandbox_finished") {
+        sandboxCommands += 1;
+        const code = event.timed_out ? `${event.status} timed out` : `${event.status}`;
+        const state = event.ok ? color.green(`exit ${code}`) : color.red(`exit ${code}`);
+        console.log(
+          `  ${color.dim("sandbox")} ${trim(event.command, 72)} ${color.dim("->")} ${state} ${color.dim(`(${(event.duration_ms / 1000).toFixed(1)}s)`)}`,
+        );
+      }
+    },
+  });
 
   try {
     events.emit("model_started", { attempt: 0, agent: mode.agent });
@@ -585,10 +622,17 @@ async function executeRun({ engine, opts, workspace, model, selection }) {
       }
     }
   } finally {
+    stopProgress();
     scope.cleanup();
   }
 
   const changes = workspaceChanges(workspace);
+  // Git speaks for tracked files; a workspace inside an ignored directory gets
+  // its evidence from the file-metadata snapshot instead of claiming zero.
+  const treeFiles = treeChangedFiles(beforeTree, workspace);
+  if (!changes.isGit) changes.files = treeFiles;
+  else if (treeFiles.length) changes.files = [...new Set([...changes.files, ...treeFiles])].sort();
+
   const preexisting = before.filter((file) => changes.files.includes(file)).length;
   const ok = approval ? false : verification ? verification.ok && !failure : run.status === 0 && !failure;
 
@@ -618,6 +662,7 @@ async function executeRun({ engine, opts, workspace, model, selection }) {
     authorization,
     approval: approval ? { ...approval, required: true } : null,
     eventsFile: events.file,
+    sandboxCommands,
   });
   for (const line of lines) console.log(line);
 
@@ -920,35 +965,14 @@ async function main() {
   }
 
   if (opts.command === "init") {
-    const result = ensureDefaultProvider(DEFAULT_PROVIDER);
-    if (result.changed) {
-      console.log(`${color.green("Added")} the ${DEFAULT_PROVIDER} provider to ${result.file}`);
-      if (result.backup) console.log(`${color.dim(`Backup of the previous config: ${result.backup}`)}`);
-      console.log(`${color.dim("Start the FreeDeepseekAPI proxy, then run: kodevra doctor")}`);
-    } else {
-      console.log(`${color.dim(`${DEFAULT_PROVIDER} is already configured in ${result.file} - left untouched.`)}`);
+    let result;
+    try {
+      result = await runInit({ requestedProvider: opts.provider, yes: opts.yes });
+    } catch (error) {
+      console.error(color.red(error.message));
+      process.exit(2);
     }
-
-    // OpenRouter reserves max_tokens up front, so a 65k default output cap can
-    // exceed a small balance even for a one-line answer. 4096 keeps the model's
-    // real context window and capabilities while staying affordable.
-    const limit = ensureModelLimit({
-      providerId: "openrouter",
-      modelId: OPENROUTER_GEMINI_MODEL,
-      output: 4096,
-      context: catalogModelContext("openrouter", OPENROUTER_GEMINI_MODEL) ?? 1048576,
-    });
-    if (limit.changed) {
-      console.log(
-        `${color.green("Set")} openrouter/${OPENROUTER_GEMINI_MODEL} max output to ${limit.limit.output} tokens ${color.dim(`(context ${limit.limit.context})`)}`,
-      );
-      if (limit.backup) console.log(`${color.dim(`Backup of the previous config: ${limit.backup}`)}`);
-    } else {
-      console.log(
-        `${color.dim(`openrouter/${OPENROUTER_GEMINI_MODEL} already capped at ${limit.limit.output} output tokens.`)}`,
-      );
-    }
-    return;
+    process.exit(result.ok || result.cancelled ? 0 : 1);
   }
 
   const selection = activeSelection({
@@ -1013,7 +1037,18 @@ async function main() {
     return;
   }
 
-  console.log(banner({ model, workspace, engine: "opencode", auth: authLine, mode: activeMode }));
+  console.log(
+    header({
+      workspace,
+      model,
+      provider: assessment.label,
+      auth: authLine,
+      sandbox: sandboxStatusLine(),
+      mode: activeMode,
+      engine: "opencode",
+      hints: opts.command === "launch" || opts.command === "run",
+    }),
+  );
 
   // Sessions stay in OpenCode's own local store; Kodevra only makes them
   // reachable from its own command surface (FRD J-06).

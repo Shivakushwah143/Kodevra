@@ -1,0 +1,7 @@
+{
+  "id": "19-escape-html",
+  "title": "Comment rendering allows stored HTML injection",
+  "category": "security",
+  "prompt": "src/comment.js builds comment markup by concatenating user text, and the helper in src/escape.js only escapes a couple of characters. Make the helper escape &, <, >, double quotes and apostrophes, and use it for both author and body so stored markup cannot inject tags. Keep the existing <article><h3>…</h3><p>…</p></article> structure and do not edit the tests.",
+  "verify": "npm test"
+}

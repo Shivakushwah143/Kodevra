@@ -1,0 +1,7 @@
+{
+  "id": "10-map-limit",
+  "title": "Concurrency-limited map ignores its limit",
+  "category": "async",
+  "prompt": "src/map-limit.js starts every callback at once, so a caller that asks for limit=2 still gets unbounded concurrency. Implement mapLimit(items, limit, fn) so results resolve in input order, no more than `limit` calls run at the same time, and an empty list resolves to []. Do not edit the tests.",
+  "verify": "npm test"
+}

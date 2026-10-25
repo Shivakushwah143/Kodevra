@@ -1,0 +1,7 @@
+{
+  "id": "14-multi-key-sort",
+  "title": "sortRows ignores direction and mutates its input",
+  "category": "sorting",
+  "prompt": "src/sort.js sorts only by the first key and reorders the caller's array in place. Implement sortRows(rows, keys) so every {key, direction} pair is honoured in order, ties keep their original order, and the input array is left untouched.",
+  "verify": "npm test"
+}

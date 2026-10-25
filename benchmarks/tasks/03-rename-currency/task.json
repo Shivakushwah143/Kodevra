@@ -1,0 +1,7 @@
+{
+  "id": "03-rename-currency",
+  "title": "Rename the money formatter across its callers",
+  "category": "multi-file",
+  "prompt": "src/money.js exports `formatPrice`, which is now called `formatCurrency` everywhere in the product. Rename the export to `formatCurrency` and update every caller (src/receipt.js and src/invoice.js) so the rendered strings stay identical. Do not edit the tests.",
+  "verify": "npm test"
+}

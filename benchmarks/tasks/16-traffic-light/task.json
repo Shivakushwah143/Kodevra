@@ -1,0 +1,7 @@
+{
+  "id": "16-traffic-light",
+  "title": "Traffic light transitions in the wrong order",
+  "category": "state-machine",
+  "prompt": "src/light.js models a traffic light, but next() skips green and reset() does nothing. Implement createTrafficLight() so the cycle is red -> green -> yellow -> red, current() reports the active state, reset() returns to red, and each instance keeps its own state.",
+  "verify": "npm test"
+}

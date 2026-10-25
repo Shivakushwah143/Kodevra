@@ -1,0 +1,8 @@
+{
+  "name": "bench-multi-key-sort",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

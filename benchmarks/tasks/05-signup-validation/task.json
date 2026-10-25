@@ -1,0 +1,7 @@
+{
+  "id": "05-signup-validation",
+  "title": "Implement signup validation",
+  "category": "validation",
+  "prompt": "Implement validateSignup({ email, password }) in src/validate.js. It must return { ok, errors } where errors lists the offending field names in the order email, password. An email needs exactly one @ and a dot after it; a password needs at least 8 characters and at least one digit. Missing or non-string values are invalid. Do not edit the tests.",
+  "verify": "npm test"
+}

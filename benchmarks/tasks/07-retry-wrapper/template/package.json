@@ -1,0 +1,8 @@
+{
+  "name": "bench-retry-wrapper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

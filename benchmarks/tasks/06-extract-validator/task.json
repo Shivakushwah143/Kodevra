@@ -1,0 +1,7 @@
+{
+  "id": "06-extract-validator",
+  "title": "Extract reusable email validation",
+  "category": "refactoring",
+  "prompt": "Signup validation is inline in src/form.js and duplicated. Extract it into src/validate.js exporting validateEmail, and use that helper from src/form.js. Behavior must not change, and the tests (including test/form.test.js) must pass without editing tests.",
+  "verify": "npm test"
+}

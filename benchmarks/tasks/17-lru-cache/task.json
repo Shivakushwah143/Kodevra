@@ -1,0 +1,7 @@
+{
+  "id": "17-lru-cache",
+  "title": "Cache never evicts and ignores recency",
+  "category": "caching",
+  "prompt": "src/lru.js implements a cache but ignores its capacity and never tracks recency, so memory grows without bound and the wrong entry is dropped. Implement a real least-recently-used cache in src/lru.js: get, set and size, with reads and updates counting as use. Do not edit the tests.",
+  "verify": "npm test"
+}

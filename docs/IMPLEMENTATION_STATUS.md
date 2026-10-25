@@ -72,7 +72,7 @@ distribution and updates, FR-030 operation-level rollback: **DEFERRED**. Git rem
 4. **Automation modes** — `read-only` / `ask` / `workspace-write`, reusing the engine's `plan` agent and `--auto`.
 5. **Sessions** — `kodevra sessions`, `-c/--continue`, `-s/--session`.
 6. **CLI hardening** — workspace existence pre-check, mode in the banner, verified exit codes, failure lines.
-7. **Regression tests** — `test/failures.test.js`, `test/verify.test.js`, `test/permissions.test.js`, `test/authorization.test.js`, `test/events.test.js`, `test/executors.test.js`, `test/sandbox.test.js`, `test/docker.test.js`, `test/sandbox-tool.test.js` (40 tests, `npm test`).
+7. **Regression tests** — `test/failures.test.js`, `test/verify.test.js`, `test/permissions.test.js`, `test/authorization.test.js`, `test/events.test.js`, `test/executors.test.js`, `test/sandbox.test.js`, `test/docker.test.js`, `test/sandbox-tool.test.js`, `test/brand.test.js`, `test/progress.test.js` (46 tests, `npm test`).
 
 ## Execution safety added in the developer-alpha batch
 
@@ -217,6 +217,94 @@ reintroducing the `_`/`-` separator bug in `src/slugify.js`:
 | cleanup | 0 sandbox directories, 0 labelled containers |
 | `npm test` | 40 pass / 0 fail |
 
+## Branded developer experience (this batch)
+
+- `lib/brand.js` now renders the startup panel: a single `◆ KODEVRA <version>` mark, the tagline, and aligned rows
+  for workspace, model, provider, auth, sandbox and mode, plus three command hints. Colour is TTY/`NO_COLOR`
+  aware; there is no animation, cursor control or multi-line ASCII art. `banner()` remains as the compact variant
+  for `--help`, `providers` and `auth`.
+- `kodevra doctor` gained a non-fatal `sandbox` row from `probeDocker()` (no image pull, 4 s timeout), so a
+  developer can see Docker readiness without starting a container. Verified: `PASS sandbox docker ready · linux engine`.
+- `lib/progress.js` tails the run's own JSONL file and turns `sandbox_started` / `sandbox_finished` into one line
+  each (`sandbox npm test -> exit 0 (2.1s)`). Startup removed a second orchestration layer: the events Kodevra
+  already writes are the only source.
+- `lib/verify.js` prints `TASK COMPLETE` with files changed, sandbox commands, verification + exit code, repair
+  attempts, duration, model, executor and sandbox status, authorization fingerprint and a single status word.
+  `VERIFIED` requires a real exit 0; a failed command prints `FAILED`, an approval refusal `REFUSED`, and no
+  verification `UNVERIFIED`. A failed verification used to be reported as UNVERIFIED; that was corrected.
+- Workspace evidence now has a fallback: `snapshotTree()` / `treeChangedFiles()` record size and mtime (skipping
+  `.git`, `node_modules`, `.tmp`, `.kodevra`, `dist`, `build`, capped at 20,000 files) so an ignored or untracked
+  workspace reports real changes instead of "no changes vs git HEAD".
+- Interactive TUI: OpenCode's interface is kept. Rebranding it would require patching upstream 1.18.30, which the
+  architecture forbids; Kodevra owns the launcher, panel, setup, diagnostics and summaries around it.
+
+Verified with a real DeepSeek run (`--executor docker --verify "npm test"`, task: run the suite and report):
+
+| Check | Observed |
+| --- | --- |
+| launch panel | `◆ KODEVRA 0.2.0`, tagline, `Workspace/Mode/Model/Executor`, `Sandbox docker ready · linux engine` |
+| doctor sandbox row | `PASS sandbox docker ready · linux engine` |
+| live sandbox line | `sandbox npm test -> exit 0 (2.1s)` from `sandbox_finished` |
+| completion summary | `Files changed 0 · Sandbox commands 1 · Verification PASS (exit 0) · Status VERIFIED` |
+| metadata fallback | ignored workspace under `.tmp` reports the edited file instead of zero |
+
+## Installable package and onboarding (this batch)
+
+- `package.json` is 0.2.0, `private: true` (installs locally, cannot be published by accident) and has an explicit
+  `files` allowlist: `bin/`, `lib/`, `tools/`, `docs/`, `README.md`, `THIRD_PARTY_NOTICES.md`. Tests, examples,
+  benchmarks, `.env`, `auth.json`, sessions, runtime snapshots and `.tmp` are excluded. No dependency was added.
+- `lib/onboarding.js` runs `kodevra init`: detects platform, Node, OpenCode version, Docker/Linux engine, config
+  path and every provider's readiness; proposes the exact writes; asks for consent when interactive; merges config
+  instead of replacing it; writes a backup; selects a ready provider only through Kodevra's own state; prints the
+  next commands. `--yes` accepts non-interactively. It never installs software and never asks for a secret.
+- `kodevra init` keeps the old behaviour (freedeepseek provider block when missing, 4096-token OpenRouter Gemini
+  cap) and now reports `unchanged ... (existing settings were preserved)` on a second run.
+
+Verified:
+
+| Check | Observed |
+| --- | --- |
+| `npm pack --dry-run` | 24 files, 54.1 kB packed / 178.6 kB unpacked; no tests, examples or benchmarks |
+| registry name | `npm view kodevra version` -> `404 not found` (name unclaimed, nothing published) |
+| local global install | `npm install -g --prefix .tmp/pkgtest ./kodevra-0.2.0.tgz` -> installed, `kodevra --version` -> `Kodevra 0.2.0` |
+| installed `--help` | branded panel + full command/option list |
+| installed `doctor` | all PASS including `sandbox docker ready · linux engine` |
+| installed real task | `kodevra run -w .tmp/pkgws --executor docker --verify "npm test"` -> `PASS (exit 0)`, `Status VERIFIED` |
+| `kodevra init` (non-TTY) | setup panel, provider table, plan, `unchanged` writes, next commands; exit 0 |
+| package content audit | `tar -tzf` lists only bin/lib/tools/docs/README/THIRD_PARTY_NOTICES/package.json |
+
+## Coding benchmarks (this batch)
+
+`benchmarks/` adds a reproducibility harness, not a claim of superiority.
+
+- 20 tasks in 19 categories (bug fix, multi-file, API implementation, validation, refactoring, error handling, test
+  repair, backend logic, async, dependency-aware, parsing, dates, sorting, strings, state machine, caching,
+  pagination, security, CLI parsing). Each has `task.json`, a deliberately broken `template/`, one hidden
+  `acceptance/acceptance.test.js`, and a reference `solution/`.
+- `runner.js` validates manifests (`--validate`), proves each fixture is solvable (`--check`: template fails,
+  hidden test fails on the template, reference solution passes), and runs both variants on the same model with the
+  repository reset from its fixture before every run.
+- Hidden tests and solutions are copied into the workspace only during `--check`; the agent never receives them.
+  A SHA-256 fixture hash is taken before each run and a changed fixture rejects the run (`fixture tampered`).
+- Workspaces live under `%TEMP%/kodevra-bench`, each initialized as its own git root, so Kodevra's workspace-scoped
+  permission overlay cannot widen and an agent has no path to the fixtures.
+- The runner resets the local proxy chat before every run
+  (`POST /reset-session?agent=all&history=drop`). Without that, all CLI runs share one sticky DeepSeek conversation
+  and sessions bleed between tasks and variants.
+- Results are resumable (`raw/<variant>/<task>.json`, `runs.jsonl`) and `--summary` regenerates
+  `results/summary.md` with executed/verified counts and the unexecuted list.
+
+Verified:
+
+| Check | Observed |
+| --- | --- |
+| `--validate` | `20 manifests checked ... all present` |
+| `--check` | 20/20 fixtures sound (`template=1 hidden=1 solution=0` for every task) |
+| fixture leak audit | 20 hidden tests, 0 present in any template |
+| pilot (`01-cart-total`, both variants) | both timed out (124) while the proxy account was in cooldown; recorded as failures |
+| proxy state during pilot | `failures: 6`, `cooldown: true`, `cooldown_remaining_sec: 267` |
+| `results/summary.md` | `Runs executed: 2 (5%)`, 0 verified, pilot note, unexecuted list, fairness + gaps |
+
 ## Known limitations
 
 - The permission overlay is policy, not an OS sandbox. An approved interactive shell command can reach any path the
@@ -248,17 +336,31 @@ reintroducing the `_`/`-` separator bug in `src/slugify.js`:
 - `--executor host` remains available and is still the default; it is not sandboxed.
 - Renewing authorization is an explicit flag (`--reapprove`), not an interactive prompt.
 - `--verify` applies to `kodevra run` only; the interactive session has no headless result to check.
+- The interactive terminal is still OpenCode's. Kodevra brands the launcher, panel, setup, diagnostics and
+  summaries; rebranding the TUI itself would require patching upstream 1.18.30 and was not attempted.
+- Benchmark fixtures are validated (20/20) but the live comparison is incomplete: the local DeepSeek proxy account
+  entered cooldown (`failures: 6`) and both pilot variants timed out. No task success rate can be claimed yet.
+- Benchmark runs use the host executor for both variants. Sandboxed execution (`--executor docker`) is a different
+  environment and is not part of this comparison.
+- The package is `private` and has not been published. Registry availability was checked once (404) and must be
+  re-checked before any release. `files` is allowlisted, but only the local tarball contents were audited.
+- Benchmark task difficulty, variance and token cost are unmeasured; one task family per category is a small sample
+  even once the full 40 runs complete.
 
 ## Verification commands
 
 ```bash
 node bin/kodevra.js doctor                  # all PASS expected
-npm test                                    # Kodevra units (40)
+npm test                                    # Kodevra units (46)
 node bin/kodevra.js run -w examples/agent-smoke --verify "npm test" "<task>"
 node bin/kodevra.js run --verify "npm test" --events-json "<task>"   # events on stderr too
 node bin/kodevra.js run --verify "npm test" --executor docker "<task>"  # isolated verification
 node bin/kodevra.js run -w examples/agent-smoke --executor docker --verify "npm test" "<task>"
                                             # agent gets sandbox_exec for its own commands
+npm pack --dry-run                          # package contents (24 files)
+npm install -g --prefix .tmp/pkgtest ./kodevra-0.2.0.tgz   # local install check
+node benchmarks/runner.js --validate        # 20 manifests
+node benchmarks/runner.js --check           # 20/20 fixtures sound
 ```
 
 The scoping checks were run in a disposable workspace and removed afterwards; to repeat them, create a scratch

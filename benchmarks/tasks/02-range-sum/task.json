@@ -1,0 +1,7 @@
+{
+  "id": "02-range-sum",
+  "title": "Inclusive range sum drops the last number",
+  "category": "bug-fix",
+  "prompt": "sumRange(from, to) in src/range.js is supposed to add every integer from `from` to `to`, inclusive. It currently drops the upper bound, and a reversed range must simply return 0. Fix the implementation and make the test suite pass. Do not edit the tests.",
+  "verify": "npm test"
+}

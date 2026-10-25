@@ -1,0 +1,7 @@
+{
+  "id": "13-add-days",
+  "title": "addDays breaks across month and year boundaries",
+  "category": "dates",
+  "prompt": "src/dates.js adds days by summing the day number, so results like 2024-01-30 plus 3 produce an invalid date. Implement addDays(isoDate, days) with UTC calendar arithmetic so month, year and leap-day boundaries are correct, including negative offsets.",
+  "verify": "npm test"
+}

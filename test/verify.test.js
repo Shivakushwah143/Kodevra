@@ -5,7 +5,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { failureSignature, repairPrompt, resultLines, workspaceChanges } from "../lib/verify.js";
+import {
+  failureSignature,
+  repairPrompt,
+  resultLines,
+  snapshotTree,
+  treeChangedFiles,
+  workspaceChanges,
+} from "../lib/verify.js";
 
 test("failure signatures ignore timing and hash noise", () => {
   const a = failureSignature("Error: expected 3 got 2\n finished in 12ms\n deadbeefcafe");
@@ -63,6 +70,21 @@ test("a verified run reports the real command and exit code", () => {
   assert.match(fail, /FAIL \(exit 1\)/);
   assert.match(fail, /AGENT_FAILED/);
   assert.doesNotMatch(fail, /PASS/);
+});
+
+test("file metadata speaks for workspaces git cannot see", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-tree-"));
+  fs.mkdirSync(path.join(dir, "src"));
+  fs.writeFileSync(path.join(dir, "src", "a.js"), "one\n", "utf8");
+  const baseline = snapshotTree(dir);
+
+  fs.writeFileSync(path.join(dir, "src", "a.js"), "two\n", "utf8");
+  fs.writeFileSync(path.join(dir, "src", "b.js"), "new\n", "utf8");
+
+  const changed = treeChangedFiles(baseline, dir);
+  assert.deepEqual(changed, ["src/a.js", "src/b.js"]);
+
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("workspace changes come from git, not from the model", () => {

@@ -1,0 +1,7 @@
+{
+  "id": "01-cart-total",
+  "title": "Cart total ignores quantity",
+  "category": "bug-fix",
+  "prompt": "The cart total is wrong for items with a quantity above one, and an item without a quantity should be counted once. Find the defect in src/cart.js, fix it, and make the test suite pass. Do not edit the tests.",
+  "verify": "npm test"
+}

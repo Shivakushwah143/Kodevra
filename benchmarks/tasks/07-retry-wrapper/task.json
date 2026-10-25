@@ -1,0 +1,7 @@
+{
+  "id": "07-retry-wrapper",
+  "title": "Retry wrapper ignores its retries option",
+  "category": "error-handling",
+  "prompt": "src/retry.js exports withRetry(fn, { retries }) but it only calls fn once, so transient failures are never retried. Implement the retry behaviour: retry only when fn throws, allow up to `retries` additional attempts, and rethrow the last error when every attempt fails. Do not edit the tests.",
+  "verify": "npm test"
+}

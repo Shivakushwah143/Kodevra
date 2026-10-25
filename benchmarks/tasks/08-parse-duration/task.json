@@ -1,0 +1,7 @@
+{
+  "id": "08-parse-duration",
+  "title": "Duration parser drops the minutes component",
+  "category": "test-repair",
+  "prompt": "A refactor broke src/duration.js: parseDuration(\"1h30m\") now returns only the hours. Restore the documented behaviour for hour and minute tokens (\"2h\" -> 120, \"45m\" -> 45, \"1h30m\" -> 90) without editing the tests.",
+  "verify": "npm test"
+}

@@ -1,0 +1,7 @@
+{
+  "id": "12-csv-fields",
+  "title": "CSV parsing ignores quoted fields",
+  "category": "parsing",
+  "prompt": "src/csv.js splits CSV rows on every comma, which corrupts quoted fields. Implement parseCsvLine so it honours double-quoted fields, escaped quotes and empty fields, and keeps the existing simple-input behaviour. Do not edit the tests.",
+  "verify": "npm test"
+}

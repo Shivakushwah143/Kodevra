@@ -1,0 +1,7 @@
+{
+  "id": "04-users-handler",
+  "title": "Implement the users HTTP handler",
+  "category": "api-implementation",
+  "prompt": "Implement createUsersHandler(users) in src/handler.js. It returns a node:http-style (req, res) handler: GET /users answers 200 with a JSON array of the users and a JSON content type, any other path answers 404 with { error: \"not found\" }, and a non-GET request to /users answers 405 with { error: \"method not allowed\" }. Do not start a server and do not edit the tests.",
+  "verify": "npm test"
+}
