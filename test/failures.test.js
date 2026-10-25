@@ -22,6 +22,36 @@ test("rate limits, unknown models and context exhaustion are distinct", () => {
   assert.equal(classifyFailure({ output: "maximum context length exceeded" }).code, "CONTEXT_EXHAUSTED");
 });
 
+test("a plan refusal is not mistaken for an expired credential", () => {
+  const failure = classifyFailure({
+    output: '403 {"error":{"message":"This model is not available with your plan"}}',
+    status: 1,
+    provider: "openai",
+  });
+  assert.equal(failure.code, "PLAN_RESTRICTED");
+  assert.match(failure.action, /kodevra providers list/);
+});
+
+test("a model the ChatGPT plan does not serve is a plan limit, not a bad login", () => {
+  const failure = classifyFailure({
+    output: "Error: The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+    status: 1,
+    provider: "openai",
+  });
+  assert.equal(failure.code, "PLAN_RESTRICTED");
+  assert.match(failure.action, /Current provider: openai/);
+});
+
+test("an expired ChatGPT session names the sign-in again", () => {
+  const failure = classifyFailure({ output: "Error: Token refresh failed: 401", status: 1, provider: "openai" });
+  assert.equal(failure.code, "AUTH_EXPIRED");
+  assert.match(failure.action, /kodevra auth login openai/);
+});
+
+test("a ChatGPT usage limit stays a rate limit, not a code failure", () => {
+  assert.equal(classifyFailure({ output: "usage_limit_reached", status: 1 }).code, "RATE_LIMITED");
+});
+
 test("a permission denial is reported as an unexecuted tool", () => {
   const failure = classifyFailure({ output: "permission denied by user" });
   assert.equal(failure.code, "TOOL_DENIED");

@@ -83,17 +83,77 @@ test("added verification files also require reapproval", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("renewal rebinds authorization to the current surface, not the old one", () => {
+test("a bare renewal cannot approve changes nobody has seen", () => {
   const dir = workspace();
   const authorization = createVerificationAuthorization({ workspace: dir, command: "npm test" });
   fs.writeFileSync(path.join(dir, "test", "slug.test.js"), "assert.equal(3, 3);\n");
 
-  const renewed = renewAuthorization(authorization, { workspace: dir, command: "npm test" });
-  assert.equal(renewed.source, "developer --reapprove");
-  assert.equal(authorizationDrift(renewed, { workspace: dir, command: "npm test" }).ok, true);
+  const bare = renewAuthorization(authorization, { workspace: dir, command: "npm test" });
+  assert.equal(bare.renewed, false);
 
+  const drift = authorizationDrift(authorization, { workspace: dir, command: "npm test" });
+  const wrong = renewAuthorization(authorization, { workspace: dir, command: "npm test", fingerprint: "0".repeat(64) });
+  assert.equal(wrong.renewed, false);
+
+  const approved = renewAuthorization(authorization, {
+    workspace: dir,
+    command: "npm test",
+    fingerprint: drift.fingerprint,
+  });
+  assert.equal(approved.renewed, true);
+  assert.equal(approved.authorization.source, "developer --reapprove <fingerprint>");
+  assert.equal(authorizationDrift(approved.authorization, { workspace: dir, command: "npm test" }).ok, true);
+
+  // Renewal binds to that exact surface: a further edit needs a new approval.
   fs.writeFileSync(path.join(dir, "test", "slug.test.js"), "assert.equal(4, 4);\n");
-  assert.equal(authorizationDrift(renewed, { workspace: dir, command: "npm test" }).ok, false);
+  assert.equal(authorizationDrift(approved.authorization, { workspace: dir, command: "npm test" }).ok, false);
 
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a same-size content change still changes the fingerprint", () => {
+  const dir = workspace();
+  const file = path.join(dir, "test", "slug.test.js");
+  fs.writeFileSync(file, "assert.equal(1, 1);\n");
+  const before = verificationSurface(dir, "npm test");
+
+  fs.writeFileSync(file, "assert.equal(2, 2);\n");
+  assert.equal(fs.statSync(file).size, "assert.equal(1, 1);\n".length);
+  const after = verificationSurface(dir, "npm test");
+  assert.notEqual(after.fingerprint, before.fingerprint);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a surface over the file limit fails closed instead of hashing a prefix", () => {
+  const dir = workspace();
+  for (let index = 0; index < 5; index += 1) {
+    fs.writeFileSync(path.join(dir, "test", `extra-${index}.test.js`), "assert.equal(1, 1);\n");
+  }
+
+  assert.throws(
+    () => verificationSurface(dir, "npm test", { maxFiles: 3 }),
+    (error) => error.code === "AUTHORIZATION_SURFACE_TOO_LARGE",
+  );
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an unreadable directory fails the authorization instead of skipping it", () => {
+  const dir = workspace();
+  assert.throws(
+    () =>
+      verificationSurface(dir, "npm test", {
+        readdir: (target, options) => {
+          if (target === path.join(dir, "test")) {
+            const error = new Error("EACCES: permission denied");
+            error.code = "EACCES";
+            throw error;
+          }
+          return fs.readdirSync(target, options);
+        },
+      }),
+    (error) => error.code === "AUTHORIZATION_SURFACE_UNREADABLE",
+  );
   fs.rmSync(dir, { recursive: true, force: true });
 });

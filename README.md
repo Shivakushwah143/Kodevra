@@ -62,7 +62,7 @@ kodevra run "fix the failing test"   # one headless task (workspace-write by def
 kodevra run "fix the failing test" --verify "npm test"
                                      # the command decides PASS/FAIL, then bounded repair
 kodevra run --verify "npm test" --executor docker "fix it"  # verify inside a container
-kodevra run --verify "npm test" --reapprove "fix it"   # renew authorization after a surface change
+kodevra run --verify "npm test" --reapprove <sha256> "fix it"  # approve one exact surface
 kodevra run --verify "npm test" --events-json "fix it" # stream events on stderr
 kodevra run -c "and add a test"      # continue the last session
 kodevra sessions                     # list local sessions for this workspace
@@ -162,10 +162,13 @@ command is **not** executed. Kodevra prints the changed files, exits 1, and asks
 ```text
   approval required the verification command was not executed
   changed by agent test/extra.test.js
-  next             re-run with --reapprove to authorize the current workspace state
+  current surface  sha256 4f1c...
+  next             review the changes, then re-run with --reapprove <fingerprint>
 ```
 
-`--reapprove` renews the authorization on the current workspace and is recorded in the event log. The gate is checked
+`--reapprove <sha256>` renews the authorization only for the surface you just looked at: the value must equal the
+fingerprint Kodevra printed. A bare `--reapprove`, or a fingerprint from an earlier state, is refused, so the flag
+cannot pre-approve changes that do not exist yet. Renewal is recorded in the event log, and the gate is checked
 between bounded repair attempts too, so a repair cannot make a suite pass by editing it.
 
 ### Docker executor (isolated verification)
@@ -191,7 +194,9 @@ kodevra run "fix the bug" --verify "npm test" --executor docker
   missing (host network at setup time, never inside the container). The report always shows executor, sandbox status,
   exit code, duration and the snapshot path.
 
-`--executor host` still exists, runs code directly on this machine and reports `not sandboxed`; it remains the default.
+**Docker is the default for `--verify`.** When Docker is available Kodevra uses the isolated executor; when it is not,
+the run refuses with `EXECUTOR_UNAVAILABLE` instead of silently running project code on the machine. Host execution
+still exists and reports `not sandboxed`, but it requires the explicit opt-in `--executor host`.
 
 Containers are not perfect security. Docker, the host kernel and Docker Desktop stay in the trusted computing base,
 a secret with an unexpected name inside a project file can still reach the snapshot, and projects that need network
@@ -225,6 +230,25 @@ and timeout state, so it can read a failure, edit the source and run the command
   so agent commands, the verification and the repairs sit in one timeline.
 
 Interactive launches (`kodevra <path>`) are unchanged: no tool is enabled there and the engine's own prompts apply.
+
+### Security model
+
+- **Fail closed.** If Kodevra cannot prove the workspace boundary, write a permission-only overlay, or read every
+  file in the verification surface, it stops with `WORKSPACE_POLICY_UNAVAILABLE`,
+  `AUTHORIZATION_SURFACE_UNREADABLE` or `AUTHORIZATION_SURFACE_TOO_LARGE`. There is no warning-and-continue path and
+  no partial fingerprint.
+- **Project extensions are untrusted.** A workspace-level `opencode.json` / `.opencode/` can add plugins or change
+  permissions, so automated runs refuse it unless you explicitly set `KODEVRA_TRUST_PROJECT_EXTENSIONS=1` after
+  reviewing it. Automated runs also pass `--pure`, so third-party plugins do not load.
+- **The overlay never carries credentials.** `OPENCODE_CONFIG` points at a generated file containing `permission` and
+  `$schema` only; provider blocks, API keys and headers are not copied. It is mode `0600` inside a `0700` directory
+  and removed on every exit path.
+- **Agent calls are bounded.** `--timeout` (default 1800 s) and `--idle-timeout` (default 300 s) cancel the whole
+  process tree on Windows and POSIX, emit `model_cancelled`, and are reported as `TIMEOUT` rather than a test failure.
+- **Logs are redacted and short-lived.** Event payloads pass through a credential redactor before they are written;
+  run files are `0600` and pruned after 14 days (`KODEVRA_EVENT_RETENTION_DAYS`).
+- **Snapshot exclusions are additive.** `KODEVRA_SANDBOX_EXCLUDE` can remove more from the Docker snapshot, never
+  less; staging reports whether `node_modules` was copied and that container output is discarded.
 
 ### Execution events
 

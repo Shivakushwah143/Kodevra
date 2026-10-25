@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { createRunLog, eventNames } from "../lib/events.js";
+import { createRunLog, eventNames, pruneRunLogs } from "../lib/events.js";
 
 test("events carry run_id, timestamp and event type", () => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-events-"));
@@ -32,6 +32,36 @@ test("events carry run_id, timestamp and event type", () => {
   assert.equal(lines[0].run_id, lines[1].run_id);
   assert.equal(lines[1].event, "verification_finished");
   assert.equal(lines[1].ok, true);
+
+  fs.rmSync(runDir, { recursive: true, force: true });
+});
+
+test("secrets never reach the event file", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-events-"));
+  const log = createRunLog({ runDir, workspace: "w", model: "m", provider: "p", mode: "workspace-write", executor: "host" });
+  log.emit("sandbox_started", { command: "deploy --token ghp_abcdefghijklmnopqrstuvwxyz012345" });
+  log.emit("failure", { message: "OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnop" });
+
+  const raw = fs.readFileSync(log.file, "utf8");
+  assert.equal(raw.includes("ghp_abcdefghijklmnopqrstuvwxyz012345"), false);
+  assert.equal(raw.includes("sk-or-v1-abcdefghijklmnop"), false);
+  assert.match(raw, /--token \*\*\*/);
+
+  fs.rmSync(runDir, { recursive: true, force: true });
+});
+
+test("old run files are pruned by the retention window", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-retention-"));
+  const old = path.join(runDir, "run_old.jsonl");
+  fs.writeFileSync(old, "{}\n");
+  const oldTime = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(old, oldTime, oldTime);
+  fs.writeFileSync(path.join(runDir, "keep.txt"), "not a run log");
+
+  const removed = pruneRunLogs({ runDir, maxAgeDays: 14 });
+  assert.equal(removed.removed, 1);
+  assert.equal(fs.existsSync(old), false);
+  assert.equal(fs.existsSync(path.join(runDir, "keep.txt")), true);
 
   fs.rmSync(runDir, { recursive: true, force: true });
 });

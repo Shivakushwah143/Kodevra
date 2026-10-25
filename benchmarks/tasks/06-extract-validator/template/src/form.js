@@ -1,8 +1,6 @@
-import { validateEmail } from "./validate.js";
-
 export function validateForm(input) {
   const errors = {};
-  if (!validateEmail(input.email)) {
+  if (!input.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) {
     errors.email = "invalid email";
   }
   if (!input.name || input.name.trim().length < 2) {

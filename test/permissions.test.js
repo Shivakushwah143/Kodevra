@@ -5,7 +5,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { permissionOverlay, workspacePrefix, writePermissionOverlay } from "../lib/permissions.js";
+import {
+  assertTrustedProject,
+  permissionOverlay,
+  projectExtensions,
+  workspacePrefix,
+  writePermissionOverlay,
+} from "../lib/permissions.js";
 
 function tempRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-perm-"));
@@ -90,23 +96,50 @@ test("the overlay file carries permission rules only and is cleaned up", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("a user-managed OPENCODE_CONFIG is merged, not replaced", () => {
+test("the overlay never copies provider credentials, even from a custom OPENCODE_CONFIG", () => {
   const dir = tempRepo();
   const nested = path.join(dir, "nested", "workspace");
   const userFile = path.join(dir, "user.json");
-  fs.writeFileSync(userFile, JSON.stringify({ model: "freedeepseek/deepseek-v4-flash", permission: { webfetch: "deny" } }));
+  fs.writeFileSync(
+    userFile,
+    JSON.stringify({
+      provider: { freedeepseek: { options: { apiKey: "sk-should-never-be-copied", baseURL: "http://127.0.0.1:9655/v1" } } },
+      permission: { webfetch: "deny" },
+    }),
+  );
 
   const overlay = writePermissionOverlay({
     workspace: nested,
     mode: "workspace-write",
     env: { OPENCODE_CONFIG: userFile },
   });
-  const data = JSON.parse(fs.readFileSync(overlay.file, "utf8"));
-  assert.equal(data.model, "freedeepseek/deepseek-v4-flash");
-  assert.equal(data.permission.webfetch, "deny");
+  const raw = fs.readFileSync(overlay.file, "utf8");
+  const data = JSON.parse(raw);
+
+  assert.equal(data.provider, undefined);
+  assert.equal(raw.includes("sk-should-never-be-copied"), false);
   assert.equal(data.permission.bash, "ask");
-  assert.equal(data.permission.external_directory, "deny");
+  assert.ok(overlay.warnings.some((warning) => /not copied/.test(warning)));
 
   overlay.cleanup();
+  assert.equal(fs.existsSync(overlay.file), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("project-level OpenCode configuration is refused unless explicitly trusted", () => {
+  const dir = tempRepo();
+  const nested = path.join(dir, "nested", "workspace");
+  fs.writeFileSync(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["some-plugin"] }));
+
+  assert.deepEqual(projectExtensions(dir).found, ["opencode.json"]);
+  assert.throws(() => assertTrustedProject(dir), /PROJECT_EXTENSIONS_UNTRUSTED|Project-level OpenCode configuration/);
+  assert.throws(() => writePermissionOverlay({ workspace: nested, mode: "workspace-write", env: { PATH: process.env.PATH } }), /Project-level/);
+  assert.equal(assertTrustedProject(dir, { trust: true }).trusted, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a malformed permission mode fails instead of diverging from the policy", () => {
+  const dir = tempRepo();
+  assert.throws(() => permissionOverlay({ workspace: dir, mode: "yolo" }), /Unknown mode/);
   fs.rmSync(dir, { recursive: true, force: true });
 });

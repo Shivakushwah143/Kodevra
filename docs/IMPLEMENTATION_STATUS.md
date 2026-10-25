@@ -19,7 +19,7 @@ diagnostics, verification-reporting and failure-classification layer. Nothing he
 | FR-006 | IMPLEMENTED | Agent reads real files in `examples/agent-smoke` during the smoke run. |
 | FR-007 | IMPLEMENTED | Agent edit plus a workspace-scoped `git status` / `git diff --stat` in the TASK RESULT block (`lib/verify.js`). |
 | FR-008 | IMPLEMENTED | Engine runs commands in the workspace; the verification command is executed by Kodevra in the same cwd (`lib/engine.js`). |
-| FR-009 | IMPLEMENTED | `--verify "<command>"` prints the exact command and exit code; PASS is only claimed on exit 0. Execution requires a developer authorization bound to a fingerprint of scripts, tests and their configuration (`lib/authorization.js`); a changed surface blocks execution until `--reapprove`. Runs through the host executor or the isolated Docker executor. The agent's own `sandbox_exec` calls use the same Docker executor, while the `--verify` gate stays authoritative for PASS/FAIL. |
+| FR-009 | IMPLEMENTED | `--verify "<command>"` prints the exact command and exit code; PASS is only claimed on exit 0. Execution requires a developer authorization bound to a fingerprint of scripts, tests and their configuration (`lib/authorization.js`); a changed surface blocks execution until the developer names the new fingerprint with `--reapprove <sha256>`, and an incomplete or oversized surface blocks authorization entirely. Runs through the host executor or the isolated Docker executor. The agent's own `sandbox_exec` calls use the same Docker executor, while the `--verify` gate stays authoritative for PASS/FAIL. |
 | FR-010 | IMPLEMENTED | Engine approvals. `--mode ask` keeps prompts, `--mode read-only` uses the `plan` agent. `bash` is `ask` in automated runs (headless shell was `auto-rejecting`) and `deny` with `--executor docker`, where the only shell is the sandboxed `sandbox_exec` tool. Read-only run left `keep.txt` unchanged. |
 | FR-011 | IMPLEMENTED | `lib/failures.js` classifies provider/adapter/tool/permission failures with a next action; `lib/verify.js` marks an unverified run `UNVERIFIED`. |
 | FR-012 | IMPLEMENTED | Credential checks are presence-only (`lib/providers.js`, `lib/auth.js`); no value is read or printed. |
@@ -38,8 +38,117 @@ diagnostics, verification-reporting and failure-classification layer. Nothing he
 | FR-020 | PARTIAL | Context/capability data is read from the engine catalog (`catalogModelContext`, provider model lists). No per-request capability negotiation or automatic model downgrade. |
 | FR-021 | IMPLEMENTED (engine) | OpenCode ships the `compaction` agent and owns compaction; Kodevra does not reimplement it. |
 | FR-022 | IMPLEMENTED | `AUTH_EXPIRED`, `RATE_LIMITED`, `MODEL_UNAVAILABLE`, `CONTEXT_EXHAUSTED`, `PROXY_UNAVAILABLE` are distinct codes with distinct next actions, separate from a failed test. |
-| FR-023 | BLOCKED | `gemini-web` is deliberately unsupported: every surveyed adapter replays Google session cookies. Supported path is `google-api` or Gemini via `openrouter`. |
-| FR-024 | PARTIAL | ChatGPT sign-in is delegated to OpenCode's official OAuth. SIWC eligibility/pricing review is a product/legal task, not code. |
+| FR-023 | BLOCKED | `gemini-web` is deliberately unsupported: Google discontinued consumer Gemini CLI OAuth on 18 June 2026 and prohibits using personal Antigravity sessions in third-party agents, and every surveyed adapter replays Google session cookies. Supported path is `google-api` (separate API key) or Gemini via `openrouter`. |
+| FR-024 | PARTIAL | ChatGPT sign-in is delegated to OpenCode 1.18.30's official `chatgpt-browser` / `chatgpt-headless` OAuth and completed end to end on this machine; `kodevra auth login chatgpt`, provider selection, plan reporting, authenticated model discovery and an API-billing guard are implemented. A live ChatGPT model response is **not proven**: the signed-in account's plan is refused by OpenAI for every plan model tried (see "Personal account model support"). SIWC eligibility/pricing review remains a product/legal task, not code. |
+
+## Personal account model support (this batch)
+
+Goal: ChatGPT subscription access without a separately billed API key, and an honest boundary for Gemini. DeepSeek,
+the Docker executor, permissions, verification, sessions and provider selection are unchanged.
+
+### ChatGPT / OpenAI
+
+- **Sign-in is delegated, never reimplemented.** `kodevra auth login chatgpt` (alias of `openai`) calls
+  `opencode auth login -p openai -m "ChatGPT Pro/Plus (browser)"`; `--headless` selects the device-code method.
+  Kodevra still runs no OAuth exchange, stores no token, and asks for no password or cookie.
+- **Credential classification.** `lib/providers.js` distinguishes `ChatGPT sign-in (opencode auth)` from
+  `env OPENAI_API_KEY` and exposes `assessment.plan` (`chatgpt` | `api-key`). `kodevra auth status` prints the plan and
+  the stored credential's lifetime from the auth entry's `expires` field (metadata only; the token is never read).
+- **Model discovery is the engine's authenticated catalog.** `opencode models openai` is the only source for the
+  OpenAI/ChatGPT model list; the static `~/.cache/opencode/models.json` catalog and the old preset list are not used
+  (`planSource: engine (authenticated)`). An account the engine lists no models for is reported `no models` and cannot
+  be selected.
+- **No silent API billing.** When the plan is `chatgpt`, `withoutApiKeyBilling()` deletes `OPENAI_API_KEY` from the
+  engine's environment for that run and the run prints
+  `plan ChatGPT plan - OPENAI_API_KEY was not passed to the engine (no API billing)`. An `api-key` selection keeps its key.
+- **Plan limits are named.** `PLAN_RESTRICTED` is matched before the generic `401/403` credential rule, because
+  re-signing in does not fix a plan boundary. `AUTH_EXPIRED` covers refresh/`invalid_grant`; `RATE_LIMITED` covers
+  `usage_limit_reached`. A login that stores nothing (cancelled, timed out, ineligible) exits 1 and says so.
+
+Observed end to end on this machine:
+
+| Check | Observed |
+| --- | --- |
+| `kodevra auth login chatgpt` | OpenCode printed the complete authorize URL and completed on the first attempt after the user approved it in the browser |
+| stored credential | `auth.json` gained `openai` with `type: oauth`, `expires` +240 h; no value printed or copied into Kodevra |
+| `opencode models openai` | 24 model ids (`gpt-5.3-codex-spark` … `gpt-6.1-sol-ultrafast`) |
+| `kodevra providers` | `openai  ready  ChatGPT sign-in (opencode auth)`; `plan openai: chatgpt (engine (authenticated))` |
+| `kodevra providers use openai/gpt-5.4` | `selected openai/gpt-5.4`, written to `~/.kodevra/state.json` only |
+| `kodevra doctor` with that selection | all PASS, including `auth ChatGPT sign-in (opencode auth) (chatgpt plan)` |
+| billing guard (`OPENAI_API_KEY=sk-dummy-not-a-key`) | `plan ChatGPT plan - OPENAI_API_KEY was not passed to the engine (no API billing)`; the request used the OAuth credential |
+| real model response | **FAILED**: `The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.` Identical message for `gpt-5.5`, `gpt-5.3-codex-spark` and `gpt-6.1-sol` (four models, four attempts, then stopped). Classified `PLAN_RESTRICTED`, exit 1, no pass claimed |
+| ChatGPT-plan coding workflow | **BLOCKED** on the same plan refusal; not attempted beyond the model check |
+| DeepSeek regression | reintroduced `_`/`-` bug in `examples/agent-smoke`: `PASS (exit 0)`, `Status VERIFIED`, docker executor, 1 file changed, 39.5 s |
+| `npm test` | 72 pass / 0 fail (adds `test/providers.test.js` and plan/auth cases in `test/failures.test.js`) |
+
+Model eligibility is enforced by OpenAI per request, and the authenticated catalog lists models the account cannot run,
+so Kodevra reports `PLAN_RESTRICTED` rather than pretending the catalog is an entitlement list.
+
+### The `missing_required_parameter` OAuth error
+
+Diagnosed before changing anything; no engine change was made.
+
+| Check | Observed |
+| --- | --- |
+| authorize URL the installed 1.18.30 builds | `response_type`, `client_id=app_EMoamEEZ73f0CkXaXp7hrann`, `redirect_uri=http://localhost:1455/auth/callback`, `scope`, `code_challenge` + `S256`, `id_token_add_organizations`, `codex_cli_simplified_flow`, `state`, `originator` |
+| same parameter set in cached 1.18.5 / 1.18.9 | identical |
+| the string `missing_required_parameter` in those three binaries | 0 occurrences - it is not an engine message |
+| the engine's exact device-code POST to `auth.openai.com/api/accounts/deviceauth/usercode` | HTTP 200 with `device_auth_id`, `user_code`, `interval` |
+| browser authorize endpoint from curl and headless Chrome | Cloudflare `Just a moment...` challenge (403), not an OAuth error page |
+| port 1455 before sign-in | free |
+| the real sign-in on 1.18.30 | authorize URL delivered complete (419 chars, 9 `&`), OAuth succeeded first try |
+| shell hand-off that splits on `&` | `cmd /c start "" <url>` delivered only `?response_type=code` and errored `'client_id' is not recognized ...` - exactly a parameter-missing authorize request |
+
+Conclusion: the installed engine's OAuth request is complete and the historical error is not reproducible on 1.18.30.
+The only reproducible way to produce a parameter-missing authorize request here is a URL that never reached the browser
+intact (a shell/platform hand-off splitting on `&`, or a truncated copy/paste). The engine prints the full URL, so it can
+be pasted whole; Kodevra adds no OAuth step of its own.
+
+### Gemini
+
+- Google discontinued consumer Gemini CLI OAuth on 18 June 2026 and explicitly prohibits using personal Antigravity
+  sessions in third-party agents, so Kodevra has no authorized consumer path. `gemini-web` stays `unsupported`:
+  `kodevra auth login gemini-web` refuses, and `kodevra providers use gemini-web` is rejected with guidance.
+- No cookie import, no session replay, no `agy` wrapper, and no API key presented as web-account access.
+- `google-api` (AI Studio key) remains a separate, optional provider; it needs nothing from this batch.
+
+## DeepSeek Web account experience (this batch)
+
+Goal: the same "sign in once, then select a model" convenience as ChatGPT OAuth, over the existing FreeDeepseekAPI
+adapter. The adapter is **not** rebuilt and the engine is untouched. This provider is labelled
+**EXPERIMENTAL WEB ADAPTER**: it is a DeepSeek Web session behind a loopback proxy, not a vendor OAuth integration.
+
+- **Sign-in is the adapter's own flow.** `kodevra auth login deepseek-web` (aliases `freedeepseek`) prints what will
+  happen, asks for explicit consent, then runs `integrations/FreeDeepseekAPI/scripts/deepseek_chrome_auth.js` in the
+  adapter directory (its documented `npm run deepseek:auth`). The adapter opens its own Chrome for Testing profile at
+  `chat.deepseek.com` and writes its session file. Kodevra never reads that file, never sees a token or cookie, and
+  refuses to start without consent (`--yes` is required when stdin is not a TTY).
+- **Status.** `kodevra auth status deepseek-web` reads `GET /health` and reports the proxy origin (loopback only),
+  session state, each login's status, cooldown, model count and the ids selectable in OpenCode.
+- **Model catalog.** `kodevra providers models freedeepseek` reads `GET /v1/models` and
+  `GET /v1/model-capabilities` and prints only ids the adapter lists, with thinking / web-search / files flags and
+  `available`/`unavailable: <reason>`. No id is hardcoded. Other providers use the engine's authenticated catalog
+  (`opencode models <provider>`), the same source as before.
+- **Variants.** The four adapter ids are ordinary models under one provider, so `-m` and `providers use` cover them:
+  `freedeepseek/deepseek-v4-flash`, `…-thinking`, `…-nosearch`, `…-thinking-nosearch`.
+- **Errors are actionable and never bypass a cooldown.** A stopped proxy reports `PROXY_UNAVAILABLE` with the start
+  command; an off-machine base URL is refused (`PROXY_NOT_LOOPBACK`); a missing/expired session reports `AUTH_EXPIRED`
+  and names `kodevra auth login deepseek-web`; a cooling login reports `RATE_LIMITED` with the remaining seconds and
+  states that Kodevra never clears it. `classifyFailure` gives the same guidance for a run that hits a limit.
+
+| Check | Observed |
+| --- | --- |
+| `kodevra providers models freedeepseek` | 4 ids from the proxy: `deepseek-v4-flash` (search), `-thinking`, `-nosearch`, `-thinking-nosearch`, each with thinking / web-search / files = yes/no |
+| `kodevra auth status deepseek-web` | `proxy http://127.0.0.1:9655 loopback only`, `health ok · 1 login(s)`, `session ready`, `deepseek-auth ready`, `4 from /v1/models · 4 selectable in opencode` |
+| proxy stopped (observed when the adapter process exited) | `health unreachable` + `the DeepSeek Web proxy at http://127.0.0.1:9655 is not answering (fetch failed)` + `Start it: cd integrations/FreeDeepseekAPI && npm start` |
+| consent gate, non-TTY without `--yes` | prints the flow, then `cancelled` and exits 1; no browser opened, nothing changed |
+| real file-reading task (`-m freedeepseek/deepseek-v4-flash-nosearch`) | agent read `src/slugify.js`, answered "the final replace in `src/slugify.js:6` uses a hyphen", 0 files changed, 21.2 s, `UNVERIFIED` (no `--verify` given, stated as such) |
+| coding smoke (`-m freedeepseek/deepseek-v4-flash-thinking`, `--verify "npm test"`) | `PASS (exit 0)`, `Status VERIFIED`, docker executor, 1 file changed, 2 sandbox commands, 35.4 s |
+| `npm test` | 77 pass / 0 fail (adds `test/deepseek-web.test.js`) |
+
+Not exercised: the adapter's browser sign-in end to end. The existing session was already ready, so running it would
+have replaced a working login; only its consent gate, adapter discovery and post-run status reporting were verified.
+The cooldown/expiry paths are covered by unit tests, not by a live throttle.
 
 ## P2 — commercial (not in this batch)
 
@@ -53,7 +162,7 @@ distribution and updates, FR-030 operation-level rollback: **DEFERRED**. Git rem
 | NFR-01 local-first | IMPLEMENTED | No Kodevra backend; sessions live in the engine's local store. |
 | NFR-02 access control | IMPLEMENTED | Engine-enforced. Automated runs deny file access outside the workspace, deny external directories, and reject unapproved shell calls; with `--executor docker` host `bash` is denied outright and model commands go through `sandbox_exec` in a disposable container. |
 | NFR-03 safety | PARTIAL | Agent file tools are workspace-scoped and unattended shell is denied, but that is permission policy, not an OS sandbox. With `--executor docker`, model-requested commands (`sandbox_exec`) and final verification both run in an ephemeral Docker container with no network, capabilities or host mounts; the agent's file tools still run on the host, and interactive launches keep unrestricted approved shell. |
-| NFR-04 observability | PARTIAL | Each run has a `run_id` and a JSONL event log (`~/.kodevra/runs/`) with timestamps, executor, sandbox flag, container image, snapshot path, staged file count, exit codes, durations, changed files, failure codes, approval decisions and `sandbox_started`/`sandbox_finished` for every agent command. No token/cost accounting or provider request IDs yet. |
+| NFR-04 observability | PARTIAL | Event payloads are credential-redacted before writing; run files are `0600` in a `0700` directory and pruned after 14 days.  Each run has a `run_id` and a JSONL event log (`~/.kodevra/runs/`) with timestamps, executor, sandbox flag, container image, snapshot path, staged file count, exit codes, durations, changed files, failure codes, approval decisions and `sandbox_started`/`sandbox_finished` for every agent command. No token/cost accounting or provider request IDs yet. |
 | NFR-05 maintainability | IMPLEMENTED | OpenCode and FreeDeepseekAPI untouched; integration defects fixed in Kodevra. |
 | NFR-06 replaceability | IMPLEMENTED | Providers are descriptors in `lib/providers.js` / `lib/config.js`; the agent loop is untouched. |
 | NFR-07 truthful completion | IMPLEMENTED | PASS requires a real exit 0; unverified runs say `UNVERIFIED`; failures print code + origin. |
@@ -72,7 +181,7 @@ distribution and updates, FR-030 operation-level rollback: **DEFERRED**. Git rem
 4. **Automation modes** — `read-only` / `ask` / `workspace-write`, reusing the engine's `plan` agent and `--auto`.
 5. **Sessions** — `kodevra sessions`, `-c/--continue`, `-s/--session`.
 6. **CLI hardening** — workspace existence pre-check, mode in the banner, verified exit codes, failure lines.
-7. **Regression tests** — `test/failures.test.js`, `test/verify.test.js`, `test/permissions.test.js`, `test/authorization.test.js`, `test/events.test.js`, `test/executors.test.js`, `test/sandbox.test.js`, `test/docker.test.js`, `test/sandbox-tool.test.js`, `test/brand.test.js`, `test/progress.test.js` (46 tests, `npm test`).
+7. **Regression tests** — `test/failures.test.js`, `test/verify.test.js`, `test/permissions.test.js`, `test/authorization.test.js`, `test/events.test.js`, `test/executors.test.js`, `test/sandbox.test.js`, `test/docker.test.js`, `test/sandbox-tool.test.js`, `test/brand.test.js`, `test/progress.test.js`, `test/redact.test.js`, `test/config.test.js`, `test/engine.test.js` (60 tests, `npm test`).
 
 ## Execution safety added in the developer-alpha batch
 
@@ -305,6 +414,31 @@ Verified:
 | proxy state during pilot | `failures: 6`, `cooldown: true`, `cooldown_remaining_sec: 267` |
 | `results/summary.md` | `Runs executed: 2 (5%)`, 0 verified, pilot note, unexecuted list, fairness + gaps |
 
+## Senior QA remediation (2026-10-25)
+
+Fourteen findings fixed in one batch. The P0 group changes enforcement from "warn and continue" to "refuse to run".
+
+| ID | Status | Change | Evidence |
+| --- | --- | --- | --- |
+| QA-01 | fixed | `writePermissionOverlay` throws `WORKSPACE_POLICY_UNAVAILABLE` when the workspace boundary, overlay write or mode cannot be enforced; `executeRun` aborts before any model call. | policy smoke in `.tmp/policyws` printed the error and `No task was started`; unit tests cover unknown mode and unwritable policy. |
+| QA-02 | fixed | Project-level `opencode.json` / `.opencode/` is refused unless `KODEVRA_TRUST_PROJECT_EXTENSIONS=1`; automated runs pass `opencode run --pure`; the permission overlay stays deny-by-default. | `kodevra run -w .tmp/policyws` refused with `PROJECT_EXTENSIONS_UNTRUSTED` before the engine; `--pure` visible in the printed engine command. |
+| QA-03 | fixed | `verificationSurface` walks without a depth cap, throws `AUTHORIZATION_SURFACE_UNREADABLE` on an unlistable directory or unreadable file, throws `AUTHORIZATION_SURFACE_TOO_LARGE` past 5,000 files, and streams SHA-256 for every file (no size-only hash). | `test/authorization.test.js`: 401-file limit test, same-size mutation test, injected `EACCES` test. |
+| QA-04 | fixed | The overlay is permission-only (`$schema` + `permission`); a custom `OPENCODE_CONFIG` is no longer parsed or copied, only warned about. File mode 0600, directory 0700, cleanup on exit. | `test/permissions.test.js` asserts `provider` is absent and `sk-should-never-be-copied` never appears in the overlay. |
+| QA-05 | fixed | `--reapprove <sha256>` must match the fingerprint of the current surface; a bare flag or stale fingerprint is refused. Renewal binds to that exact surface, so later edits block again. | `test/authorization.test.js`: bare/stale renewal rejected, matching fingerprint accepted, follow-up edit rejected. |
+| QA-06 | fixed | `06-extract-validator` template had been replaced by its solution; restored the inline-validation starter with no `src/validate.js`. | `--check`: `06-extract-validator template=1 hidden=1 solution=0`; total `20/20 fixtures are sound`. |
+| QA-07 | fixed | Both variants receive `-m <model>`; Kodevra also gets `--executor host`; the runner records `model_reported` and marks `model_mismatch` as a failure. | `benchmarks/runner.js` record fields; `--validate` still 20/20. |
+| QA-08 | fixed | `ok` requires agent exit 0, no timeout, no model mismatch and acceptance exit 0; `error_type` separates `timeout`, `rate_limit`, `auth`, `infra`, `agent_failure`, `test_failure`, `fixture_tampered`. | `benchmarks/runner.js` `classifyRun`; previous pilot records now read `error_type` rather than a bare FAIL. |
+| QA-09 | fixed | `streamEngine` gained wall-clock and idle limits with process-tree kill (`taskkill /T /F` on Windows, process group elsewhere), `model_cancelled` events, `--timeout`/`--idle-timeout` and a `TIMEOUT` failure code. | `test/engine.test.js`: wall-clock and idle runs both return status 124 with the right reason. |
+| QA-10 | fixed | `ensureDefaultProvider` / `ensureModelLimit` throw `CONFIG_INVALID` and leave a malformed config byte-for-byte untouched (no backup, no write). | `test/config.test.js`: malformed JSON and non-object JSON both refused. |
+| QA-11 | fixed | New `lib/redact.js`; event payloads are redacted recursively, run files are 0600, the run directory 0700, and files older than 14 days are pruned. | `test/redact.test.js`; `test/events.test.js` secret + retention tests. |
+| QA-12 | fixed | Benchmark runs share one timeout budget, require a successful proxy session reset before scoring, retry only `infra` failures (max 2, no cooldown waits) and classify the rest. | `benchmarks/runner.js` `executeTask`/`classifyRun`; `--retries` help text. |
+| QA-13 | fixed | `--verify` defaults to Docker when available; without it Kodevra refuses with `EXECUTOR_UNAVAILABLE` and asks for explicit `--executor host`. Selected Docker always runs `checkDocker()` preflight. | `defaultVerifyExecutor()` in `bin/kodevra.js`; README security model; benchmark runner passes `--executor host` explicitly. |
+| QA-14 | fixed | `KODEVRA_SANDBOX_EXCLUDE` adds exclusions (never removes); staging returns warnings for staged `node_modules`, custom exclusions and discarded container output; reports print them. | `lib/sandbox.js` `customExclusions`/`warnings`; `lib/sandbox-command.js` prints warnings. |
+
+Unresolved restrictions are explicit: the agent's file tools still run on the host; Docker contains commands, not
+edits; project-extension trust is a developer review, not a scanner; benchmark results remain incomplete while the
+local provider is in cooldown.
+
 ## Known limitations
 
 - The permission overlay is policy, not an OS sandbox. An approved interactive shell command can reach any path the
@@ -344,6 +478,18 @@ Verified:
   environment and is not part of this comparison.
 - The package is `private` and has not been published. Registry availability was checked once (404) and must be
   re-checked before any release. `files` is allowlisted, but only the local tarball contents were audited.
+- ChatGPT OAuth works, but this account's plan is refused by OpenAI for every plan model tried
+  (`PLAN_RESTRICTED`). The authenticated engine catalog is not an entitlement list: it lists models the account may not
+  run, and only a real request reveals that. No ChatGPT-plan model response or coding workflow is proven yet.
+- Kodevra reads only `type`/`expires` from the engine's auth store for the lifetime line. Token refresh, expiry handling
+  and sign-out remain OpenCode's; Kodevra reports the state instead of managing it.
+- `deepseek-web` is an EXPERIMENTAL WEB ADAPTER: a personal DeepSeek Web session behind a loopback proxy, not an
+  official OAuth/API integration, and it depends on the external Apache-2.0 FreeDeepseekAPI project being present in
+  `integrations/` (git-ignored, so a fresh clone must install it before the sign-in command can run).
+- The adapter loads session files at start. After `kodevra auth login deepseek-web`, the running proxy must be reloaded
+  (`POST /admin/accounts/reload`) or restarted; Kodevra prints that command and does not call the admin API itself.
+- One DeepSeek login serves one in-flight chat, and cooldowns belong to the adapter. Kodevra reports them and never
+  clears, shortens or bypasses a cooldown.
 - Benchmark task difficulty, variance and token cost are unmeasured; one task family per category is a small sample
   even once the full 40 runs complete.
 
@@ -351,7 +497,7 @@ Verified:
 
 ```bash
 node bin/kodevra.js doctor                  # all PASS expected
-npm test                                    # Kodevra units (46)
+npm test                                    # Kodevra units (60)
 node bin/kodevra.js run -w examples/agent-smoke --verify "npm test" "<task>"
 node bin/kodevra.js run --verify "npm test" --events-json "<task>"   # events on stderr too
 node bin/kodevra.js run --verify "npm test" --executor docker "<task>"  # isolated verification
@@ -359,6 +505,12 @@ node bin/kodevra.js run -w examples/agent-smoke --executor docker --verify "npm 
                                             # agent gets sandbox_exec for its own commands
 npm pack --dry-run                          # package contents (24 files)
 npm install -g --prefix .tmp/pkgtest ./kodevra-0.2.0.tgz   # local install check
+node bin/kodevra.js auth login chatgpt       # OpenCode's official ChatGPT OAuth
+node bin/kodevra.js auth login deepseek-web  # the FreeDeepseekAPI adapter's own browser sign-in (asks first)
+node bin/kodevra.js auth status deepseek-web # proxy health, session, cooldown, model ids
+node bin/kodevra.js providers models freedeepseek   # /v1/models + /v1/model-capabilities
+node bin/kodevra.js auth status              # credential source, plan, expiry
+node bin/kodevra.js providers use openai/<model>   # only models the engine lists
 node benchmarks/runner.js --validate        # 20 manifests
 node benchmarks/runner.js --check           # 20/20 fixtures sound
 ```

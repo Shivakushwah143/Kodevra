@@ -50,13 +50,14 @@ Options
   --variant <v>         opencode | kodevra | both (default: both)
   --model <id>          model id for both variants (default: ${DEFAULT_MODEL})
   --force               re-run tasks that already have a result
+  --retries <n>         retry an infrastructure failure (default: 1, max: 2)
   --timeout <ms>        per agent run (default: ${AGENT_TIMEOUT})
   --summary             regenerate results/summary.md from recorded results
 `);
 }
 
 function parse(argv) {
-  const opts = { tasks: [], variant: "both", model: DEFAULT_MODEL, force: false, check: false, list: false, summary: false, all: false, validate: false, timeout: AGENT_TIMEOUT };
+  const opts = { tasks: [], variant: "both", model: DEFAULT_MODEL, force: false, check: false, list: false, summary: false, all: false, validate: false, retries: 1, timeout: AGENT_TIMEOUT };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--help" || arg === "-h") {
@@ -68,6 +69,7 @@ function parse(argv) {
     else if (arg === "--check") opts.check = true;
     else if (arg === "--summary") opts.summary = true;
     else if (arg === "--force") opts.force = true;
+    else if (arg === "--retries") opts.retries = Math.max(0, Math.min(2, Number(argv[(index += 1)]) || 0));
     else if (arg === "--task") opts.tasks.push(...String(argv[(index += 1)] || "").split(",").filter(Boolean));
     else if (arg === "--variant") opts.variant = argv[(index += 1)] || "both";
     else if (arg === "--model") opts.model = argv[(index += 1)] || DEFAULT_MODEL;
@@ -233,6 +235,10 @@ function buildAgent(variant, task, workspace, options) {
         workspace,
         "--verify",
         task.verify,
+        "--executor",
+        "host",
+        "-m",
+        options.model,
         "--no-doctor",
         task.prompt,
       ],
@@ -310,36 +316,71 @@ function writeResult(record) {
   return file;
 }
 
-async function runTask(task, variant, options) {
-  const existing = readResult(variant, task);
-  if (existing && !options.force) {
-    console.log(`  skip    ${variant.padEnd(8)} ${task.id} ${existing.ok ? "PASS" : "FAIL"} (recorded; --force to re-run)`);
-    return existing;
-  }
+/** The model id the CLI itself reported, if it printed one. */
+function reportedModel(output) {
+  const labeled = `${output}`.match(/Model\s+(freedeepseek\/[^\s]+)/);
+  if (labeled) return labeled[1];
+  const badge = `${output}`.match(/>\s*(?:build|plan)\s+·\s+([^\s]+)/);
+  return badge ? `freedeepseek/${badge[1]}` : null;
+}
 
+/**
+ * A benchmark PASS is a clean agent exit AND a passing acceptance suite on the
+ * same model. A hidden-test pass after an agent timeout is not a success, and
+ * infrastructure failures are named instead of being scored as model failures.
+ */
+function classifyRun({ agent, verification, session, modelMismatch, tampered }) {
+  if (tampered) return "fixture_tampered";
+  if (!session.ok) return "infra";
+  if (agent.timedOut) return "timeout";
+  if (agent.status !== 0) {
+    if (/429|rate limit|too many requests|cooldown/i.test(agent.output)) return "rate_limit";
+    if (/401|403|unauthori[sz]ed|invalid api key/i.test(agent.output)) return "auth";
+    if (/ECONNREFUSED|fetch failed|proxy/i.test(agent.output)) return "infra";
+    return "agent_failure";
+  }
+  if (modelMismatch) return "model_mismatch";
+  if (verification.status !== 0) return "test_failure";
+  return "success";
+}
+
+async function executeTask(task, variant, options, attempt) {
   const workspace = path.join(WORK_DIR, variant, task.id);
   resetWorkspace(task, workspace);
 
   const beforeTree = snapshotTree(workspace);
   const fixtureHash = hashTree(task.dir);
   const session = await resetProviderSession(options.model);
+  const base = {
+    task: task.id,
+    title: task.title,
+    category: task.category,
+    variant,
+    model: options.model,
+    started_at: new Date().toISOString(),
+    attempt,
+    session_reset: session.ok,
+    session_reset_detail: session.reason,
+    tokens: null,
+    tool_failures: null,
+  };
+
+  if (!session.ok) {
+    return { ...base, ok: false, error_type: "infra", error: "provider session reset failed", duration_ms: 0, agent_exit: null, agent_timed_out: false, verify_exit: null, verify_tail: "", agent_tail: "", files_changed: [] };
+  }
+
   const agent = buildAgent(variant, task, workspace, options);
-  console.log(`  run     ${variant.padEnd(8)} ${task.id} ${path.basename(task.dir)}`);
+  console.log(`  run     ${variant.padEnd(8)} ${task.id} ${path.basename(task.dir, "")}${attempt > 1 ? ` retry ${attempt}` : ""}`);
   const agentRun = await run(agent.command, agent.args, { cwd: workspace, timeout: options.timeout, shell: agent.shell });
   const filesChanged = treeChangedFiles(beforeTree, workspace);
+  const tampered = hashTree(task.dir) !== fixtureHash;
 
-  // A read-only hash guard: if an agent reached back into the fixtures, the
-  // run is invalid and is reported as such instead of scoring a fake pass.
-  if (hashTree(task.dir) !== fixtureHash) {
-    const record = {
-      task: task.id,
-      title: task.title,
-      category: task.category,
-      variant,
-      model: options.model,
+  if (tampered) {
+    return {
+      ...base,
       ok: false,
+      error_type: "fixture_tampered",
       error: "fixture tampered during the run",
-      started_at: new Date().toISOString(),
       duration_ms: agentRun.durationMs,
       agent_exit: agentRun.status,
       agent_timed_out: agentRun.timedOut,
@@ -347,55 +388,66 @@ async function runTask(task, variant, options) {
       verify_tail: "",
       agent_tail: tail(agentRun.output),
       files_changed: filesChanged,
-      attempts: 1,
       repairs: null,
-      tool_failures: null,
       provider_error: providerError(agentRun.output),
-      tokens: null,
-      session_reset: session.ok,
-      session_reset_detail: session.reason,
     };
-    writeResult(record);
-    console.log(`  TAMPER  ${variant.padEnd(8)} ${task.id} fixture changed during the run; result rejected`);
-    return record;
   }
 
   const acceptance = applyAcceptance(task, workspace);
-  const verification = await run(task.verify, [], {
-    cwd: workspace,
-    timeout: VERIFY_TIMEOUT,
-    shell: true,
-  });
+  const verification = await run(task.verify, [], { cwd: workspace, timeout: VERIFY_TIMEOUT, shell: true });
   for (const file of acceptance) fs.rmSync(path.join(workspace, "test", file), { force: true });
 
+  const reported = reportedModel(agentRun.output);
+  const modelMismatch = Boolean(reported && reported !== options.model);
   const repairs = variant === "kodevra" ? countRepairs(agentRun.output) : null;
-  const record = {
-    task: task.id,
-    title: task.title,
-    category: task.category,
-    variant,
-    model: options.model,
-    ok: verification.status === 0,
-    started_at: new Date().toISOString(),
+  const errorType = classifyRun({ agent: agentRun, verification, session, modelMismatch, tampered });
+
+  return {
+    ...base,
+    ok: errorType === "success",
+    error_type: errorType,
+    error: errorType === "success" ? null : errorType,
     duration_ms: agentRun.durationMs + verification.durationMs,
     agent_exit: agentRun.status,
     agent_timed_out: agentRun.timedOut,
+    agent_timeout_reason: agentRun.timedOut ? "limit" : null,
     verify_exit: verification.status,
     verify_tail: tail(verification.output),
     agent_tail: tail(agentRun.output),
     files_changed: filesChanged,
     attempts: 1 + (repairs ?? 0),
     repairs,
-    tool_failures: null,
     provider_error: providerError(agentRun.output),
-    tokens: null,
-    session_reset: session.ok,
-    session_reset_detail: session.reason,
+    model_reported: reported,
+    model_mismatch: modelMismatch,
   };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runTask(task, variant, options) {
+  const existing = readResult(variant, task);
+  if (existing && !options.force) {
+    console.log(`  skip    ${variant.padEnd(8)} ${task.id} ${existing.ok ? "PASS" : "FAIL"} (recorded; --force to re-run)`);
+    return existing;
+  }
+
+  let record;
+  for (let attempt = 1; attempt <= options.retries + 1; attempt += 1) {
+    record = await executeTask(task, variant, options, attempt);
+    // Retry only infrastructure failures. Timeouts, rate limits and model
+    // behaviour are results, not transient noise.
+    if (record.error_type === "infra" && attempt <= options.retries) {
+      console.log(`  retry   ${variant.padEnd(8)} ${task.id} after infrastructure failure (${record.error})`);
+      await sleep(2000);
+      continue;
+    }
+    break;
+  }
 
   writeResult(record);
   console.log(
-    `  ${record.ok ? "PASS" : "FAIL"}    ${variant.padEnd(8)} ${task.id} files=${filesChanged.length} agent_exit=${agentRun.status} verify_exit=${verification.status} ${(record.duration_ms / 1000).toFixed(1)}s`,
+    `  ${record.ok ? "PASS" : "FAIL"}    ${variant.padEnd(8)} ${task.id} (${record.error_type}) files=${record.files_changed.length} agent_exit=${record.agent_exit} verify_exit=${record.verify_exit} ${(record.duration_ms / 1000).toFixed(1)}s`,
   );
   return record;
 }
