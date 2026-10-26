@@ -22,6 +22,19 @@ test("a wall-clock limit cancels the call and reports 124", async () => {
   assert.ok(run.durationMs < 10_000, `took ${run.durationMs}ms`);
 });
 
+test("the first-byte mark fires once, before the stream is consumed", async () => {
+  let marks = 0;
+  const script = 'process.stdout.write("a");setTimeout(() => process.stdout.write("b"), 30)';
+  const run = await streamEngine(node, ["-e", script], {
+    cwd: process.cwd(),
+    forward: false,
+    onFirstByte: () => { marks += 1; },
+  });
+
+  assert.equal(run.status, 0);
+  assert.equal(marks, 1);
+});
+
 test("the engine is told the workspace through PWD, not the caller's shell", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-cwd-"));
   const run = await streamEngine(node, ["-e", "process.stdout.write(process.env.PWD || '')"], {

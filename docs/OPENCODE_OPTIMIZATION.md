@@ -198,7 +198,7 @@ for an unattended run reported as a denied tool call rather than a silent failur
 ## 5. Reproducing this
 
 ```bash
-# 1. Unit and integration tests (105 tests)
+# 1. Unit and integration tests (108 tests)
 npm test
 
 # 2. Diagnostics for the target model (proxy/docker are environmental)
@@ -229,7 +229,73 @@ cd examples/agent-smoke && npm test        # currently passes; remove .toLowerCa
 
 ---
 
-## 6. Suggested Terra command line
+## 6. Second pass — where a run's time actually goes
+
+One instrumented `kodevra run` (free model, `--trace`, `--executor host`, `--no-doctor`) writes
+phase marks into the run's own event log: `~/.kodevra/runs/<run>.jsonl`, events `phase` with
+`ms` measured from process start.
+
+| Phase | Measured | Notes |
+| --- | --- | --- |
+| process start → argv parsed | 1 ms | `cli_parsed` |
+| PATH scan for the engine | 30 ms | `engine_located` |
+| config + catalog + provider | 135 ms | `provider_assessed` (6 MB catalog parse, cached auth read) |
+| model profile / effort | +0 ms | `model_profile` (catalog already memoized) |
+| workspace scan + executor | 430 ms | `executor_ready`: `git status`, `git diff --stat`, tree snapshot |
+| permission overlay | 507 ms | `overlay_written` (one `git rev-parse` now instead of two) |
+| engine process spawned | 544 ms | `engine_spawn` — end of Kodevra-side work |
+| first engine byte | **13 772 ms** | `engine_first_byte`: OpenCode startup + provider preparation |
+| model finished | 44 651 ms | `model_finished` (6 steps, 8 tool calls) |
+| verification | 1 062 ms | `verification_finished.duration_ms` |
+| total | 46 010 ms | `run_finished.duration_ms` |
+
+**Not measurable from the engine stream:** the split between model inference and tool execution
+inside one step. The engine emits `step_finish` with tokens and cost, and tool parts with a name and
+status, but no per-tool duration, so any split would be a guess. `first_text_ms` is `null` on a run
+whose steps are all tool calls — also reported as such instead of being invented.
+
+The single largest item is not Kodevra's: **13.2 s of engine startup and provider preparation** before
+the first byte, which is OpenCode's own cold start. Everything Kodevra does before the model is
+contacted totals **544 ms**.
+
+### Findings, ranked
+
+| # | Finding | Rank | Status |
+| --- | --- | --- | --- |
+| 1 | `projectRoot` spawned `git rev-parse --show-toplevel` twice per run (overlay + trust gate) | P0 | **fixed** (memoized per process) |
+| 2 | `workspaceChanges` re-checked "is this a git work tree" on every call — 3 calls per run | P0 | **fixed** (memoized per process) |
+| 3 | Engine cold start (13.2 s) dominates every run | P0 | not Kodevra's; documented |
+| 4 | Docker probe (~200 ms) still runs before a run that explicitly asked for `--executor host` | P1 | documented, not implemented |
+| 5 | Tree snapshot walks the workspace even when git already answered | P1 | documented, not implemented (changes reporting semantics) |
+| 6 | Final `workspaceChanges` repeats the work `emitFileChanges` did moments earlier | P2 | documented |
+| 7 | Proxy probe can wait up to 4 s when the host blackholes the port (58 ms when refused) | P2 | documented |
+
+No separate agent, retry or planning work was added, and the Codex harness files were not touched.
+
+### Before / after (same machine, same fixture, min of 5)
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| `projectRoot` ×3 | 122.9 ms | **0.4 ms** |
+| `workspaceChanges` ×1 | 91.4 ms | **62.1 ms** |
+| `workspaceChanges` ×3 | 357.6 ms | **210.8 ms** |
+
+A run calls `projectRoot` twice and `workspaceChanges` three times, so the measured component costs
+translate to roughly **80 ms less Kodevra-side work per run** (one `git rev-parse --show-toplevel`
+≈ 48 ms, two `rev-parse --is-inside-work-tree` ≈ 30 ms). End-to-end wall-clock cannot be compared
+between two model runs: in the A/B above the model took 4 steps on one and 6 on the other, which
+moved the total by 15 s — that is model variance, not harness speed.
+
+### Fast path (Task 4)
+
+A normal `kodevra run` already skips preflight work that is either cached or genuinely needed: the
+engine version, the authenticated model list, the model catalog and the Docker probe are all answered
+once per process or per identity, and `--no-doctor` drops diagnostics entirely. Measured pre-model
+overhead is 544 ms, of which ~330 ms is workspace evidence (`git status`, `git diff --stat`, tree
+snapshot) that the "Files changed" report and the verification gate depend on. Removing it would
+change reporting semantics, so it stays. No further fast path was safe to add in this pass.
+
+## 7. Suggested Terra command line
 
 ```bash
 # One-off, cheapest safe configuration for a funded account:

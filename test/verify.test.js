@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  clearWorkspaceChangeCache,
   failureSignature,
   repairPrompt,
   resultLines,
@@ -100,6 +101,19 @@ test("file metadata speaks for workspaces git cannot see", () => {
   const changed = treeChangedFiles(baseline, dir);
   assert.deepEqual(changed, ["src/a.js", "src/b.js"]);
 
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("whether a workspace is a git work tree is asked once per process", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-gitprobe-"));
+  clearWorkspaceChangeCache();
+  const first = workspaceChanges(dir).isGit;
+
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  assert.equal(workspaceChanges(dir).isGit, first, "the answer is memoized for the run");
+
+  clearWorkspaceChangeCache();
+  assert.equal(workspaceChanges(dir).isGit, true, "a cleared cache asks git again");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -8,8 +8,10 @@ import path from "node:path";
 import {
   assertCredentialFree,
   assertTrustedProject,
+  clearProjectRootCache,
   permissionOverlay,
   projectExtensions,
+  projectRoot,
   workspacePrefix,
   writePermissionOverlay,
 } from "../lib/permissions.js";
@@ -163,6 +165,22 @@ test("project-level OpenCode configuration is refused unless explicitly trusted"
   assert.throws(() => assertTrustedProject(dir), /PROJECT_EXTENSIONS_UNTRUSTED|Project-level OpenCode configuration/);
   assert.throws(() => writePermissionOverlay({ workspace: nested, mode: "workspace-write", env: { PATH: process.env.PATH } }), /Project-level/);
   assert.equal(assertTrustedProject(dir, { trust: true }).trusted, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the project root is resolved once per process, and can be re-resolved", () => {
+  const dir = tempRepo();
+  const nested = path.join(dir, "nested", "workspace");
+  clearProjectRootCache();
+  assert.equal(projectRoot(nested), fs.realpathSync.native(dir));
+
+  // Making the nested directory its own repository must not change a cached
+  // answer, because a run cannot change it mid-flight either.
+  spawnSync("git", ["init", "-q"], { cwd: nested });
+  assert.equal(projectRoot(nested), fs.realpathSync.native(dir));
+
+  clearProjectRootCache();
+  assert.equal(projectRoot(nested), fs.realpathSync.native(nested));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

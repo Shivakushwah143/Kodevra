@@ -139,6 +139,19 @@ ${color.bold("Environment")}
   KODEVRA_STATE               path to Kodevra's provider selection state
 `;
 
+// Phase marks: how long each Kodevra-side step took, relative to this process
+// starting. They are written into the run's event log (metadata only) so a run
+// can be split into bootstrap / engine startup / model / verification instead of
+// guessing where the seconds went.
+const PROCESS_STARTED_AT = Date.now();
+const phaseMarks = [];
+
+function phaseMark(name, extra = {}) {
+  const entry = { name, ms: Date.now() - PROCESS_STARTED_AT, ...extra };
+  phaseMarks.push(entry);
+  return entry;
+}
+
 const VALUE_FLAGS = new Set([
   "-w",
   "--workspace",
@@ -493,6 +506,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     console.error(`  ${color.dim("No verification ran, and Kodevra did not fall back to the host executor.")}`);
     process.exit(2);
   }
+  phaseMark("executor_ready", { executor: executor.name, checked: Boolean(executorInfo) });
 
   // Model-requested shell only exists inside the Docker sandbox. The trusted
   // tool is installed into OpenCode's global tools directory (never the
@@ -525,6 +539,11 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   // Docker executor, native host bash is denied and sandbox_exec is the only
   // shell the agent has; otherwise bash stays on "ask", which the engine
   // auto-rejects when nobody can approve it.
+  // Everything Kodevra did before this run started is still worth timing, so the
+  // marks collected during bootstrap are replayed into the run's own log.
+  for (const entry of phaseMarks) events.emit("phase", entry);
+  const markNow = (name, extra = {}) => events.emit("phase", phaseMark(name, extra));
+
   let scope;
   try {
     scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec, modelConfig });
@@ -534,6 +553,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     console.error(color.dim("No task was started: the workspace policy could not be enforced."));
     process.exit(2);
   }
+  markNow("overlay_written");
   if (sandboxExec) {
     Object.assign(scope.env, {
       KODEVRA_SANDBOX_EXEC: "1",
@@ -620,6 +640,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     : null;
   const runAgent = async (args, attempt) => {
     if (trace) trace.beginCall();
+    markNow("engine_spawn", { attempt });
     const result = await streamEngine(engine, args, {
       cwd: workspace,
       env: scope.env,
@@ -627,6 +648,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
       idleMs: agentIdleMs,
       onLine: traceSink,
       forwardStdout: !trace,
+      onFirstByte: () => markNow("engine_first_byte", { attempt }),
     });
     const metrics = trace ? trace.endCall() : null;
     if (metrics) events.emit("model_metrics", { attempt, ...metrics });
@@ -1363,8 +1385,10 @@ async function main() {
     return;
   }
 
+  phaseMark("cli_parsed");
   const config = readConfig();
   const engine = findExecutable("opencode");
+  phaseMark("engine_located");
 
   if (opts.command === "version") {
     const selection = activeSelection({ config: config.data, engine });
@@ -1394,6 +1418,7 @@ async function main() {
     engine,
   });
   const assessment = assessProvider(selection.provider, { config: config.data, engine });
+  phaseMark("provider_assessed");
 
   if (assessment.kind === "unsupported") {
     console.error(`${color.red(`${assessment.label} is not supported by Kodevra.`)}`);
@@ -1442,6 +1467,7 @@ async function main() {
     process.exit(2);
   }
   opts.reasoningEffort = effort.effort;
+  phaseMark("model_profile");
 
   let modelConfig = null;
   let outputPlan = { output: null, note: null, source: "model catalog" };
@@ -1523,6 +1549,7 @@ async function main() {
     console.log("");
     failed = result.failed;
     optionalMissing = result.checks.filter((check) => !check.ok && !check.fatal).length;
+    phaseMark("diagnostics");
   }
 
   if (diagnosticsAlways) {
