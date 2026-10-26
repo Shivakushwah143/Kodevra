@@ -2,42 +2,73 @@
 
 **Your Models. Your Code. Your Agent.**
 
-Kodevra is a thin, branded entry point for autonomous coding. It deliberately ships **no agent loop of its own**:
-[OpenCode](https://opencode.ai) owns tool execution, permissions, sessions and the terminal interface, while
-FreeDeepseekAPI provides OpenAI-compatible access to DeepSeek. Kodevra adds the product identity, a default model,
-startup diagnostics, verification reporting and a one-word command.
+Kodevra is a branded entry point for autonomous coding. It ships **no agent loop of its own**:
+[OpenCode](https://opencode.ai) owns tool execution, permissions, sessions and the terminal interface, and the
+official Codex CLI is available as an opt-in second engine. Kodevra adds the product identity, provider and
+engine selection, startup diagnostics, a real verification gate and one-word commands.
 
-```
-  ◆ KODEVRA 0.2.0
-  Your Models. Your Code. Your Agent.
-
-  Workspace  ./my-project
-  Model      freedeepseek/deepseek-v4-flash
-  Provider   DeepSeek (FreeDeepseekAPI)
-  Auth       ready · local proxy
-  Sandbox    docker ready · linux engine
-  Mode       workspace-write - workspace edits allowed
-```
-
-## Requirements
-
-- Node.js 20 or newer
-- OpenCode 1.18+ (`npm i -g opencode-ai`)
-- The FreeDeepseekAPI proxy running on `http://127.0.0.1:9655/v1` with the `deepseek-v4-flash` model
+This is an alpha: the surface can change between `0.3.0-alpha.x` releases.
 
 ## Install
 
 ```bash
-npm install -g .                # from a checkout, or: npm install -g ./kodevra-0.2.0.tgz
-kodevra init                    # guided setup: detects node, engine, Docker, providers
-kodevra doctor                  # checks engine, provider, model, proxy, sandbox and workspace
-kodevra                         # launch the agent in the current directory
+npm install -g kodevra@alpha
+kodevra --version
 ```
 
-`npm pack` produces a 54 kB tarball with 24 files: `bin/`, `lib/`, `tools/`, `docs/`, `README.md` and
-`THIRD_PARTY_NOTICES.md`. Tests, examples, benchmarks, credentials, sessions and runtime state are not packaged.
-The package is `private` on purpose: it installs locally but cannot be published by accident. The name `kodevra`
-is unclaimed on the public registry as of 2026-10-25, so no release has been made.
+What it needs:
+
+- Node.js 20 or newer
+- an engine: OpenCode (`npm i -g opencode-ai`, the default) and/or the Codex CLI (`npm i -g @openai/codex`)
+- a credential for the provider you run - see [Authentication and usage limits](#authentication-and-usage-limits)
+
+## Check
+
+```bash
+kodevra doctor
+```
+
+`doctor` prints one PASS/FAIL line per requirement (engine, provider, credential, model, proxy, workspace) and
+the exact command that fixes anything that is not ready. `kodevra engines` shows the same for each engine.
+
+## Run
+
+```bash
+cd your-project
+kodevra run "fix the failing test"
+```
+
+Without a task, `kodevra` opens an interactive session in the current directory.
+
+## Codex Fast example
+
+```bash
+kodevra run --engine codex --speed fast \
+  -m openai/gpt-5.6-terra \
+  "fix the failing test"
+```
+
+OpenCode stays the default engine. `kodevra engines` lists both engines and their readiness, and
+`kodevra engines use codex` persists the choice. `--speed fast` asks Codex for the priority service tier it
+advertises for that model; if the model advertises none, the run stops instead of silently running standard.
+
+## Authentication and usage limits
+
+**You authenticate with the underlying provider or harness.** Kodevra holds no credential store of its own, and
+it never asks for a password, an API key or a browser cookie. Sign in once with the engine you run, through that
+engine's own supported flow:
+
+- OpenCode: `opencode auth login` (or export the provider's API key)
+- Codex: `codex login` (or export `OPENAI_API_KEY`)
+
+Credentials stay in the engine's own store; Kodevra only checks that they are present. `kodevra doctor` reports
+what the engine can actually see.
+
+**Your provider's usage limits still apply.** Every request is made on your account, against your plan, quota,
+rate limits and billing. Kodevra adds no quota, resells nothing and cannot bypass a limit; when a provider refuses
+a request the run reports the provider's answer instead of hiding it.
+
+## Guided setup
 
 ### `kodevra init`
 
@@ -387,6 +418,44 @@ pilot is blocked by the local proxy account entering cooldown; `benchmarks/resul
 attempted runs as infrastructure failures rather than as a model comparison, and the reasons are documented in
 `benchmarks/README.md`. Do not read it as evidence that either agent is better.
 
+### Second engine: Codex (opt-in)
+
+`--engine codex` runs the official open-source Codex CLI through its documented `codex exec --json` interface.
+OpenCode remains the default. Kodevra adds no agent loop: Codex owns planning, tools, its sandbox and its sessions;
+Kodevra owns launch, the verification gate, bounded repair and the normalised outcome.
+
+```bash
+kodevra engines                     # readiness of both engines
+kodevra engines use codex           # persist the choice (kodevra engines use opencode to revert)
+kodevra run --engine codex --verify "npm test" "<task>"
+kodevra run --engine codex --speed fast -m openai/gpt-5.6-terra "<task>"   # Codex priority tier
+kodevra doctor --engine codex       # Codex install, auth, config, sandbox and provider reachability
+kodevra run --engine codex --outcome outcome.json "<task>"
+
+node benchmarks/codex/runner.js --check    # 5 scenario fixtures
+node benchmarks/codex/runner.js --all      # kodevra --engine codex vs the official CLI
+```
+
+Codex has its own credentials and provider configuration (`~/.codex`); Kodevra never imports them into OpenCode or
+vice versa, and never reads a credential value. See `docs/CODEX_BENCHMARK.md` for the integration contract, the
+five benchmark scenarios, the real results and the current blockers.
+
+`--speed fast` selects the service tier Codex itself advertises for the model (`-c service_tier="priority"`). Kodevra
+never guesses: it reads the tier list from Codex's own catalog (`codex debug models` / `--bundled`), and if the model
+does not advertise a priority tier the run stops with `FAST_TIER_UNAVAILABLE` instead of silently running standard.
+A custom `model_catalog_json` replaces Codex's bundled catalog, which hides that metadata; for a fast run Kodevra passes
+a merged catalog (the user's entries plus every bundled entry they do not define) to that one child invocation, and
+deletes it afterwards. Codex's `config.toml`, `auth.json` and custom catalog are never modified. `--speed default` is
+the default and changes nothing.
+
+Before the first turn, `run --engine codex` also runs the `--verify` command once and hands Codex a one-line
+`<kodevra_context>` block of measured facts: workspace root, files, that failing output, the paths it mentions, and
+on Windows the three shell constraints that otherwise cost a fresh agent five turns to discover. The task text is
+passed through unchanged; `--no-context` runs the previous, context-free baseline. Codex runs also print and record
+a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the per-command analysis behind it, and
+`node benchmarks/codex/wrapper-overhead.mjs` measures Kodevra's own overhead against a stub Codex CLI (no model call,
+no credentials), reporting cold/warm/p95 for `--speed default` and `--speed fast`.
+
 ## Layout
 
 | Path | Purpose |
@@ -397,6 +466,13 @@ attempted runs as infrastructure failures rather than as a model comparison, and
 | `lib/auth.js` | delegates sign-in to OpenCode and verifies credential presence only |
 | `lib/doctor.js` | startup diagnostics (node, engine, config, provider, model, auth, proxy, workspace) |
 | `lib/engine.js` | streams the engine, captures its tail, runs the verification command |
+| `lib/harness.js` | execution-engine registry and selection (OpenCode default, Codex opt-in) |
+| `lib/codex.js` | Codex CLI adapter: discovery, auth presence, flag translation, JSONL evidence |
+| `lib/packet.js` | The `<kodevra_context>` facts block handed to Codex before its first turn |
+| `lib/codex-catalog.js` | Codex's own model catalog: `--speed fast` planning, priority-tier check, entry-preserving merge, bundled-catalog cache |
+| `lib/timings.js` | Per-phase clock readings for one run (`--engine codex` prints them) |
+| `lib/outcome.js` | `kodevra.outcome/1` normalised result (`--outcome`, `run_outcome` event) |
+| `lib/executable.js` | shared PATH executable resolver |
 | `lib/verify.js` | workspace-scoped git + metadata evidence, failure signatures, repair prompt, completion summary |
 | `lib/progress.js` | tails the run's JSONL events to print live sandbox command progress |
 | `lib/onboarding.js` | guided `kodevra init`: detection, provider choice, consent, safe defaults |
@@ -412,6 +488,7 @@ attempted runs as infrastructure failures rather than as a model comparison, and
 | `lib/events.js` | JSONL execution events for a future branded terminal interface |
 | `lib/brand.js` | wordmark, tagline, colour |
 | `benchmarks/` | 20-task comparison harness, fixtures, runner and recorded results |
+| `benchmarks/codex/` | 5-scenario Codex suite: `kodevra --engine codex` vs the official CLI |
 | `test/` | Node built-in tests: taxonomy, verification, sandboxing, branding, progress, onboarding |
 | `docs/IMPLEMENTATION_STATUS.md` | FRD coverage by requirement ID |
 | `docs/OPENCODE_OPTIMIZATION.md` | harness audit: model settings, startup, tracing, measurements and blockers |

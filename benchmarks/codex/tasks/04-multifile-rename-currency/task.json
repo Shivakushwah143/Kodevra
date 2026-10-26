@@ -1,0 +1,7 @@
+{
+  "id": "04-multifile-rename-currency",
+  "title": "Rename the money formatter across consumers",
+  "category": "multi-file",
+  "prompt": "The money helper src/money.js exports formatMoney, but the project standardises on formatCurrency. Rename the export to formatCurrency and update every caller in src/receipt.js and src/summary.js so the rendered output is unchanged. No file under src/ may still mention the old name, and the test suite must pass. Do not edit the tests.",
+  "verify": "npm test"
+}
