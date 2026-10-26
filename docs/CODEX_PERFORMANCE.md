@@ -316,10 +316,22 @@ Docker stays optional there and the proxy check still runs.
 - `bin/kodevra.js` - pass the already-resolved `harnessInfo`/`codexTarget` into
   diagnostics instead of letting it re-run `codex --version` and
   `codex login status`; thread the real executor; mark `diagnostics` in the
-  phase timings.
-- `lib/codex.js` - bundled catalog cached by binary identity (path, size,
-  mtime) under `~/.kodevra/cache/`, skipped entirely when speed is not fast;
-  `resolveCodexRun` exported as the single resolution entry point.
+  phase timings. The post-agent `git status`/`git diff` view is computed once and
+  reused by the outcome (it was asked twice per run); after a repair run, which
+  lets the model edit again, it is recomputed so the recorded changes stay exact.
+- `lib/codex-catalog.js` - `bundledCatalog()` caches `codex debug models
+  --bundled` by binary identity (path, size, mtime, reported version) under
+  `~/.kodevra/cache/`, model metadata only; the merged temp catalog is written
+  compact instead of pretty-printed (322 kB instead of ~700 kB per fast run).
+- `lib/providers.js` - the opencode catalog (~6 MB) is parsed once per process
+  and reused while size/mtime are unchanged; a Codex run no longer asks for it
+  at all, and no longer runs `opencode models openai` (3.5-4.3 s here) for a
+  banner label.
+- `lib/docker-executor.js` - `probeDocker()` memoised per process; the startup
+  panel probes Docker only when Docker is the executor (or `--verify` is about to
+  choose one), so a host/native run never pays the 200-430 ms failed probe.
+- `lib/codex.js` - `resolveCodexRun` exported as the single resolution entry
+  point; `readCodexConfig` also reports `model_catalog_json`/`profile` presence.
 - `lib/engine.js` - quote the command when `KODEVRA_CODEX_BIN` is a `.cmd` path
   containing spaces (it was previously split by the shell).
 - `lib/doctor.js` - allow a custom `engine` object (test seam) so the unchanged
@@ -348,6 +360,23 @@ the run otherwise.
 A second run of the same after code gave 1023/1440 ms and 1015/1385 ms
 (default/fast wall median/p95), so treat ~0.85-1.1 s as the range.
 
+The committed harness, run unmodified against both revisions, reproduces the
+same conclusion with larger absolutes (this shell has a working `opencode` on
+PATH, so the old wrapper paid `opencode models openai` on every run):
+
+| harness | default wall median / p95 | fast wall median / p95 |
+| --- | --- | --- |
+| `dd98384` + `--no-doctor` (see note) | 4535 / 4755 ms | 5393 / 6661 ms |
+| this revision, unmodified | 718-1103 / 813-1652 ms | 861-1277 / 1041-1667 ms |
+
+Note: at `dd98384` the harness cannot complete a single run on this machine.
+`Diagnostics failed` because `codex provider` probed the (stopped) freedeepseek
+proxy for an OpenAI run and `sandbox` reported the missing Docker engine, so the
+before row adds `--no-doctor`; the after row is the script exactly as committed.
+Phase medians at `dd98384`, warm, default / fast: engine probe 300/300,
+**assessment 3500/4000**, workspace scan 4100/4900, spawn 4100/4900, changes
+4400/5300, total 4400/5300 ms.
+
 Phase medians (warm, default / fast):
 
 | phase | before | after |
@@ -370,22 +399,28 @@ Caveat: the stub is ~70 ms of Node start, not the real CLI. The real
 measured earlier at 0.4-1.1 s of the old 3-5 s wrapper, so a real-binary wrapper
 after this change should land near 1.2-1.7 s, still under the 3 s target.
 
-### F. Cold / warm / p95 (after, 11 runs each)
+### F. Cold / warm / p95 (after, 11 runs each, committed harness)
 
-| mode | cold total | warm median | warm p95 |
-| --- | --- | --- | --- |
-| default | 3500 ms | 700 ms | 900 ms |
-| fast | 1100 ms | 900 ms | 1400 ms |
+Final run on a quiet machine, milliseconds:
 
-The default "cold" run is the first invocation after a fresh `git init` in the
+| mode | cold wall | warm wall median | warm wall p95 | warm total median | warm total p95 |
+| --- | --- | --- | --- | --- | --- |
+| default | 728 | 718 | 813 | 600 | 700 |
+| fast | 1000 | 861 | 1041 | 700 | 800 |
+
+Across repeated runs of the same script the after medians landed between 696 and
+1103 ms (default) and 854 and 1277 ms (fast), with p95 up to 1652 / 1667 ms (a
+repeat of the final run: 696 / 839 and 854 / 1005 ms). The
+default "cold" run is the first invocation after a fresh `git init` in the
 fixture (index and status are cold); the fast cold run also writes the bundled
-catalog cache once. Warm ≤ 3 s: met. Stretch ≤ 1.5 s: met on medians, and on
-default p95; fast p95 (1.58 s) sits just over because the catalog file is read
-fresh on some runs.
+catalog cache once, which is the 1000 vs 728 ms difference.
+
+Warm ≤ 3 s: met with a wide margin. Stretch ≤ 1.5 s: met on every median; p95
+meets it on the quiet runs and sits above it (1.65 s) when the machine is busy.
 
 ### G. Tests
 
-`npm test` - **155 tests, 155 pass, 0 fail**. New coverage:
+`npm test` - **156 tests, 156 pass, 0 fail**. New coverage:
 `test/codex-diagnostics.test.js` asserts explicit OpenAI never calls the proxy
 probe, explicit DeepSeek does, the configured default is still probed without an
 override, native Codex never probes Docker while `--executor docker` does and a

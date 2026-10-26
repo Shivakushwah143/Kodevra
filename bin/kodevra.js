@@ -964,7 +964,9 @@ async function executeRun({
     stopSpeed();
   }
 
-  const changes = changesAfterRun ?? workspaceChanges(workspace);
+  // A repair run lets the model edit again, so the post-agent view is stale once
+  // one has happened; without a repair it is still the truth and is reused.
+  const changes = repairs > 0 || !changesAfterRun ? workspaceChanges(workspace) : changesAfterRun;
   timings.mark("changes");
   // Git speaks for tracked files; a workspace inside an ignored directory gets
   // its evidence from the file-metadata snapshot instead of claiming zero.

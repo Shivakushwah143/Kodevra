@@ -417,7 +417,9 @@ Before the first turn, `run --engine codex` also runs the `--verify` command onc
 `<kodevra_context>` block of measured facts: workspace root, files, that failing output, the paths it mentions, and
 on Windows the three shell constraints that otherwise cost a fresh agent five turns to discover. The task text is
 passed through unchanged; `--no-context` runs the previous, context-free baseline. Codex runs also print and record
-a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the per-command analysis behind it.
+a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the per-command analysis behind it, and
+`node benchmarks/codex/wrapper-overhead.mjs` measures Kodevra's own overhead against a stub Codex CLI (no model call,
+no credentials), reporting cold/warm/p95 for `--speed default` and `--speed fast`.
 
 ## Layout
 
@@ -432,7 +434,7 @@ a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the 
 | `lib/harness.js` | execution-engine registry and selection (OpenCode default, Codex opt-in) |
 | `lib/codex.js` | Codex CLI adapter: discovery, auth presence, flag translation, JSONL evidence |
 | `lib/packet.js` | The `<kodevra_context>` facts block handed to Codex before its first turn |
-| `lib/codex-catalog.js` | Codex catalog merge for `--speed fast`: priority-tier check, temp catalog, cleanup |
+| `lib/codex-catalog.js` | Codex's own model catalog: `--speed fast` planning, priority-tier check, entry-preserving merge, bundled-catalog cache |
 | `lib/timings.js` | Per-phase clock readings for one run (`--engine codex` prints them) |
 | `lib/outcome.js` | `kodevra.outcome/1` normalised result (`--outcome`, `run_outcome` event) |
 | `lib/executable.js` | shared PATH executable resolver |
