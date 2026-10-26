@@ -545,6 +545,15 @@ command feeding a one-line `<kodevra_context>` facts block (`lib/packet.js`, `--
 phase table (`lib/timings.js`) printed for Codex runs and stored as `outcome.timing.phases_ms`. The packet is one
 line because a Windows `.cmd` shim truncates a prompt at the first newline.
 
+`--speed fast` (`lib/codex-catalog.js`) selects the service tier Codex advertises for the model through a child-only
+`-c service_tier="priority"`. Because the user's `model_catalog_json` replaces Codex's bundled catalog (which hides
+`gpt-5.6-terra`'s metadata and makes Codex drop the tier), Kodevra merges `codex debug models --bundled` with the
+effective catalog into a `0600` temp file for that one invocation and deletes it afterwards; `config.toml`,
+`auth.json` and the custom catalog are untouched. A model without a `priority` tier stops the run with
+`FAST_TIER_UNAVAILABLE` before any model call. `outcome.speed` records requested/effective tier, tier support and
+catalog source, so a standard run can never be recorded as fast. Live timing is still unmeasured: the account was
+out of quota (`RATE_LIMITED`, resets 25 Nov 2026) when this landed.
+
 ## Codex limitations
 
 - The npm-global Codex install on this machine is incomplete (`@openai/codex-win32-x64` missing). Kodevra reports

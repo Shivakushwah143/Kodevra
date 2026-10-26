@@ -35,10 +35,12 @@ import {
   codexFailureText,
   codexSandbox,
   parseCodexEvents,
+  readCodexCatalog,
   readCodexConfig,
   renderCodexRun,
   resolveCodexRun,
 } from "../lib/codex.js";
+import { normalizeSpeed, planFastSpeed } from "../lib/codex-catalog.js";
 import { HARNESS_NAMES, activeHarness, harnessRows, harnessStatus, normalizeHarness } from "../lib/harness.js";
 import { normalizeOutcome, writeOutcome } from "../lib/outcome.js";
 import { runInit } from "../lib/onboarding.js";
@@ -114,6 +116,8 @@ ${color.bold("Options")}
       --agent <name>          OpenCode agent to use (default: build, or plan in read-only)
       --mode <mode>           read-only | ask | workspace-write
                               (default: workspace-write for run, ask for launch)
+      --speed <mode>          default | fast - Codex only; fast selects Codex's
+                              advertised priority service tier for this run
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
       --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
       --context, --no-context give Codex the workspace facts Kodevra measured first
@@ -162,6 +166,7 @@ const VALUE_FLAGS = new Set([
   "--provider",
   "--agent",
   "--mode",
+  "--speed",
   "--verify",
   "--max-repairs",
   "-s",
@@ -219,6 +224,7 @@ function parse(argv) {
     help: false,
     headless: false,
     mode: null,
+    speed: "default",
     verify: null,
     maxRepairs: 2,
     session: null,
@@ -281,6 +287,7 @@ function parse(argv) {
       opts.autoExplicit = true;
     } else if (arg === "--headless") opts.headless = true;
     else if (arg === "--mode") opts.mode = argv[(index += 1)];
+    else if (arg === "--speed") opts.speed = argv[(index += 1)];
     else if (arg === "--verify") opts.verify = argv[(index += 1)];
     else if (arg === "--max-repairs") opts.maxRepairs = Number(argv[(index += 1)]);
     else if (arg === "-s" || arg === "--session") opts.session = argv[(index += 1)];
@@ -513,6 +520,9 @@ async function executeRun({
   model,
   selection,
   assessment,
+  codexSpeed = null,
+  speedConfig = [],
+  stopSpeed = () => {},
   timings = createTimings(PROCESS_STARTED_AT),
 }) {
   const startedAt = Date.now();
@@ -616,6 +626,14 @@ async function executeRun({
     console.log(
       `  ${color.dim("scope  ")} ${workspace} ${color.dim(`- codex sandbox ${mode.name === "read-only" ? "read-only" : "workspace-write"}`)}`,
     );
+    if (codexSpeed?.requested === "fast") {
+      const catalog = codexSpeed.catalog_source === "bundled+user" ? "merged temp catalog" : "bundled catalog";
+      console.log(
+        `  ${color.dim("speed  ")} fast ${color.dim("->")} service_tier ${codexSpeed.effective_service_tier} ${color.dim(
+          `· ${codexSpeed.model} · ${catalog} (${codexSpeed.catalog_models} models)`,
+        )}`,
+      );
+    }
   } else {
     console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; shell needs approval")}`);
   }
@@ -648,6 +666,7 @@ async function executeRun({
     sandbox_exec: sandboxExec,
     verify: opts.verify ?? null,
   });
+  events.emit("speed_selected", codexSpeed ?? { requested: "default", effective_service_tier: null });
 
   let authorization = null;
   if (opts.verify) {
@@ -747,7 +766,7 @@ async function executeRun({
       withProbePrefix(
         harness,
         harnessInfo,
-        agentInvocation({ harness, opts, workspace, selection, mode, codexTarget, prompt: firstPrompt }),
+        agentInvocation({ harness, opts, workspace, selection, mode, codexTarget, prompt: firstPrompt, speedConfig }),
       ),
       {
         cwd: workspace,
@@ -840,6 +859,7 @@ async function executeRun({
             mode,
             codexTarget,
             message: repairMessage,
+            speedConfig,
             repair: true,
           });
           events.emit("model_started", { attempt: repairs, agent: harness === "codex" ? "codex exec" : mode.agent });
@@ -922,6 +942,7 @@ async function executeRun({
   } finally {
     stopProgress();
     scope.cleanup();
+    stopSpeed();
   }
 
   const changes = workspaceChanges(workspace);
@@ -966,6 +987,7 @@ async function executeRun({
     startedAt,
     endedAt: Date.now(),
     codex: codexEvidence,
+    speed: codexSpeed,
     timings: timings.toJSON(),
   });
   timings.mark("total");
@@ -1053,6 +1075,7 @@ function agentInvocation({
   codexTarget,
   message = opts.message,
   prompt = null,
+  speedConfig = [],
   repair = false,
 }) {
   if (harness === "codex") {
@@ -1061,6 +1084,7 @@ function agentInvocation({
       workspace,
       target: codexTarget,
       prompt: prompt ?? (message.length ? message.join(" ") : null),
+      config: speedConfig,
       interactive: false,
     });
   }
@@ -1635,6 +1659,13 @@ async function main() {
   }
   timings.mark("bootstrap");
 
+  const speed = normalizeSpeed(opts.speed);
+  if (!speed) {
+    console.error(`${color.red(`Unknown speed "${opts.speed}".`)} Use: default | fast`);
+    console.error(`  ${color.dim("--speed is an opt-in Codex service tier; the default is unchanged.")}`);
+    process.exit(2);
+  }
+
   if (opts.command === "help" || opts.help) {
     console.log(banner({}));
     console.log(USAGE);
@@ -1709,6 +1740,41 @@ async function main() {
           config: harnessInfo.config ?? readCodexConfig(),
         })
       : null;
+
+  // Service-tier plumbing. `default` adds nothing at all: the argv, the catalog
+  // and the environment stay exactly what they were. `fast` is planned against
+  // the catalog Codex itself reports, and refuses rather than pretending.
+  let codexSpeed = {
+    requested: speed,
+    effective_service_tier: null,
+    model_supports_priority: null,
+    catalog_source: null,
+  };
+  let speedConfig = [];
+  let stopSpeed = () => {};
+  if (speed === "fast") {
+    if (harness !== "codex") {
+      console.error(`${color.red("--speed fast is a Codex option.")} ${color.dim("OpenCode has no service tier to select.")}`);
+      process.exit(2);
+    }
+    const plan = planFastSpeed({
+      model: codexTarget.model ?? harnessInfo.config?.model ?? null,
+      bundled: readCodexCatalog(harnessInfo.probe, { bundled: true }),
+      user: readCodexCatalog(harnessInfo.probe),
+    });
+    if (!plan.ok) {
+      console.error(`\n  ${color.red(plan.code)} ${plan.message}`);
+      console.error(`  ${color.yellow("->")} ${plan.hint}`);
+      console.error(color.dim("  No task was started; the run was not silently downgraded to the standard tier."));
+      process.exit(2);
+    }
+    codexSpeed = plan.evidence;
+    speedConfig = plan.config;
+    stopSpeed = plan.cleanup;
+    // The merged catalog is a temporary file for this invocation; it must not
+    // outlive the process even on an early exit.
+    process.once("exit", stopSpeed);
+  }
 
   if (assessment.kind === "unsupported") {
     console.error(`${color.red(`${assessment.label} is not supported by Kodevra.`)}`);
@@ -1826,7 +1892,21 @@ async function main() {
   }
 
   if (opts.command === "run") {
-    await executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment, timings });
+    await executeRun({
+      engine,
+      harness,
+      harnessInfo,
+      codexTarget,
+      opts,
+      workspace,
+      model,
+      selection,
+      assessment,
+      codexSpeed,
+      speedConfig,
+      stopSpeed,
+      timings,
+    });
     return;
   }
 
@@ -1842,6 +1922,7 @@ async function main() {
         workspace,
         target: codexTarget,
         prompt: opts.message.length ? opts.message.join(" ") : null,
+        config: speedConfig,
         interactive: true,
         extra: opts.passthrough,
       }),

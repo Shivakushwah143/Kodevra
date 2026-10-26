@@ -393,6 +393,7 @@ Kodevra owns launch, the verification gate, bounded repair and the normalised ou
 kodevra engines                     # readiness of both engines
 kodevra engines use codex           # persist the choice (kodevra engines use opencode to revert)
 kodevra run --engine codex --verify "npm test" "<task>"
+kodevra run --engine codex --speed fast -m openai/gpt-5.6-terra "<task>"   # Codex priority tier
 kodevra doctor --engine codex       # Codex install, auth, config, sandbox and provider reachability
 kodevra run --engine codex --outcome outcome.json "<task>"
 
@@ -403,6 +404,14 @@ node benchmarks/codex/runner.js --all      # kodevra --engine codex vs the offic
 Codex has its own credentials and provider configuration (`~/.codex`); Kodevra never imports them into OpenCode or
 vice versa, and never reads a credential value. See `docs/CODEX_BENCHMARK.md` for the integration contract, the
 five benchmark scenarios, the real results and the current blockers.
+
+`--speed fast` selects the service tier Codex itself advertises for the model (`-c service_tier="priority"`). Kodevra
+never guesses: it reads the tier list from Codex's own catalog (`codex debug models` / `--bundled`), and if the model
+does not advertise a priority tier the run stops with `FAST_TIER_UNAVAILABLE` instead of silently running standard.
+A custom `model_catalog_json` replaces Codex's bundled catalog, which hides that metadata; for a fast run Kodevra passes
+a merged catalog (the user's entries plus every bundled entry they do not define) to that one child invocation, and
+deletes it afterwards. Codex's `config.toml`, `auth.json` and custom catalog are never modified. `--speed default` is
+the default and changes nothing.
 
 Before the first turn, `run --engine codex` also runs the `--verify` command once and hands Codex a one-line
 `<kodevra_context>` block of measured facts: workspace root, files, that failing output, the paths it mentions, and
@@ -423,6 +432,7 @@ a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the 
 | `lib/harness.js` | execution-engine registry and selection (OpenCode default, Codex opt-in) |
 | `lib/codex.js` | Codex CLI adapter: discovery, auth presence, flag translation, JSONL evidence |
 | `lib/packet.js` | The `<kodevra_context>` facts block handed to Codex before its first turn |
+| `lib/codex-catalog.js` | Codex catalog merge for `--speed fast`: priority-tier check, temp catalog, cleanup |
 | `lib/timings.js` | Per-phase clock readings for one run (`--engine codex` prints them) |
 | `lib/outcome.js` | `kodevra.outcome/1` normalised result (`--outcome`, `run_outcome` event) |
 | `lib/executable.js` | shared PATH executable resolver |

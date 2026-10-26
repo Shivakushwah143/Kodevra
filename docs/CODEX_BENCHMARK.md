@@ -116,6 +116,41 @@ Kodevra reports this in `kodevra doctor`. It does not edit `config.toml`.
 `--ignore-user-config` is deliberately not used: it removes the elevated Windows
 sandbox setting and makes the silent-no-op failure more likely.
 
+## 4.1 Service tier (`--speed`)
+
+`--speed default` (the default) adds nothing: same argv, same catalog, same
+environment. `--speed fast` selects the tier Codex advertises for the model,
+which on the installed CLI is `priority` ("Fast - 1.5x speed, increased usage"):
+
+```
+-c service_tier="priority"
+```
+
+There is no Codex CLI flag for this, so it goes through Codex's documented
+`-c key=value` config override in the child argv only. Kodevra never writes
+`~/.codex/config.toml`, `auth.json` or the user's custom catalog.
+
+**Catalog masking.** `model_catalog_json` *replaces* Codex's bundled catalog, so
+a custom DeepSeek catalog makes `gpt-5.6-terra` unknown and Codex then drops the
+tier ("Configured service tier `priority` is not advertised as supported ... and
+will be omitted from requests"). Kodevra reads both views from the installed CLI
+(`codex debug models --bundled` for the version's own catalog, `codex debug
+models` for the effective one), merges the user's entries first and appends every
+bundled entry the user does not define, writes the result to a `0600` temp file,
+and passes it as `-c model_catalog_json="<temp>"` for that invocation only. The
+file is removed when the run ends (also on early exit).
+
+**Honest failure.** Before spawning, the resolved model's catalog entry is
+checked for a `priority` tier. If it has none, or the model id cannot be
+resolved, the run stops with `FAST_TIER_UNAVAILABLE` and no model is called - it
+never shows "fast" while running standard.
+
+**Evidence.** `outcome.speed` records `requested`, `effective_service_tier`,
+`model_supports_priority` and `catalog_source` (`bundled` or `bundled+user`); a
+`default` run records nulls, so a standard run can never be mistaken for a fast
+one. The run log carries the same object as a `speed_selected` event. No path,
+credential or token is included.
+
 ## 5. Normalised execution outcome
 
 Every `kodevra run` now produces one record, written with

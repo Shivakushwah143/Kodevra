@@ -183,6 +183,39 @@ Not done, on purpose: no second agent loop, no subagents, no Codex patching, no
 prompt rewrites of the task, no change to the verification gate, no OpenCode
 changes.
 
+## 7.1 The service tier (`--speed fast`)
+
+Codex advertises a `priority` tier ("Fast - 1.5x speed, increased usage") for
+`gpt-5.6-terra` in the catalog compiled into 0.149.1. There is no CLI flag for
+it; the supported switch is the `service_tier` config value, so Kodevra passes
+`-c service_tier="priority"` in the child argv for `--speed fast` only.
+
+The tier was inert on this machine for a second reason: `model_catalog_json`
+replaces Codex's bundled catalog, so terra had no metadata and Codex dropped the
+tier with an explicit warning. Kodevra now merges `codex debug models --bundled`
+(the installed version's own catalog) with the effective catalog into a
+throwaway `0600` file passed to that invocation only, and removes it afterwards.
+`config.toml`, `auth.json` and the custom DeepSeek catalog are never modified.
+
+Measured on the plain CLI before the plumbing existed (same fixture, same flags,
+only the tier differing):
+
+| tier | runs | verified | wall clock |
+| --- | --- | --- | --- |
+| standard | 3 (one from the earlier report) | 3/3 | 127.8, 131.9, 103.7 s |
+| priority | 3 | 3/3 | 55.6, 43.4, 69.5 s |
+
+The 127.8 s reference ran on Codex's fallback metadata (no catalog override);
+the other standard runs and all priority runs used the catalog that advertises
+the tier. That is the one difference that cannot be removed, because the tier
+does not exist until the catalog provides it.
+
+Through `kodevra run --engine codex --speed fast` the plumbing is verified (the
+real CLI accepted the tier and the merged 12-model catalog: `outcome.speed` =
+`{"requested":"fast","effective_service_tier":"priority","model_supports_priority":true,"catalog_source":"bundled+user"}`),
+but the agent run itself returned `RATE_LIMITED`: the account is out of quota
+until 25 Nov 2026. **No Kodevra timing claim is made.**
+
 ## 8. The <= 90 s target: not claimed
 
 With the measured constants, `<= 90 s` needs `<= 7` model turns at ~13 s plus
