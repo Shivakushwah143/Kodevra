@@ -1,0 +1,45 @@
+{
+  "checked_at": "2026-10-26T05:47:21.313Z",
+  "tasks": [
+    {
+      "task": "01-bugfix-invoice-tax",
+      "category": "bug-fix",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "02-feature-csv-escape",
+      "category": "feature",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "03-refactor-extract-validators",
+      "category": "refactoring",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "04-multifile-rename-currency",
+      "category": "multi-file",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    },
+    {
+      "task": "05-debug-async-batcher",
+      "category": "debugging",
+      "ok": true,
+      "template_verify_exit": 1,
+      "hidden_verify_exit": 1,
+      "solution_verify_exit": 0
+    }
+  ]
+}

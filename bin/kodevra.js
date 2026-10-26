@@ -30,6 +30,17 @@ import {
   workspaceChanges,
 } from "../lib/verify.js";
 import { findExecutable, runDiagnostics } from "../lib/doctor.js";
+import {
+  buildCodexArgs,
+  codexFailureText,
+  codexSandbox,
+  parseCodexEvents,
+  readCodexConfig,
+  renderCodexRun,
+  resolveCodexRun,
+} from "../lib/codex.js";
+import { HARNESS_NAMES, activeHarness, harnessRows, harnessStatus, normalizeHarness } from "../lib/harness.js";
+import { normalizeOutcome, writeOutcome } from "../lib/outcome.js";
 import { runInit } from "../lib/onboarding.js";
 import {
   adapterInfo,
@@ -64,6 +75,7 @@ import {
   normalizeProvider,
   readAuthProviders,
   readCatalog,
+  readState,
   withoutApiKeyBilling,
   writeState,
 } from "../lib/providers.js";
@@ -80,6 +92,9 @@ const USAGE = `${color.bold("Usage")}
   kodevra providers use <p>   select a provider for future runs (Kodevra state only)
   kodevra providers current   show the active provider/model
   kodevra providers models <p>  real model ids from the provider itself
+  kodevra engines             list execution engines and their readiness
+  kodevra engines use <name>  select opencode (default) or codex for future runs
+  kodevra engines current     show the active execution engine
   kodevra auth login chatgpt  sign in with a ChatGPT Plus/Pro account (OpenCode's official OAuth)
   kodevra auth login deepseek-web  run the FreeDeepseekAPI adapter's own browser sign-in
   kodevra auth login <p>      sign in to any provider through OpenCode's official flow
@@ -90,6 +105,7 @@ ${color.bold("Options")}
   -w, --workspace <path>      workspace to run in
   -p, --provider <key>        provider for this run (default: ${DEFAULT_PROVIDER})
   -m, --model <provider/model>  default: ${DEFAULT_PROVIDER}/${DEFAULT_MODEL_ID}
+      --engine <name>         execution engine: opencode (default) | codex
       --agent <name>          OpenCode agent to use (default: build, or plan in read-only)
       --mode <mode>           read-only | ask | workspace-write
                               (default: workspace-write for run, ask for launch)
@@ -104,6 +120,7 @@ ${color.bold("Options")}
       --timeout <seconds>     wall-clock limit for one agent call (default 1800)
       --idle-timeout <secs>   cancel an agent call with no output for this long (default 300)
       --events-json           stream structured execution events to stderr
+      --outcome <file>        write the normalised run outcome as JSON to this file
   -y, --yes                   accept the setup plan without prompting (init)
       --auto, --no-auto       auto-approve permissions on an interactive launch
                               (ignored for run: unattended runs never auto-approve)
@@ -119,9 +136,12 @@ ${color.bold("Provider credentials")}
 
 ${color.bold("Environment")}
   KODEVRA_MODEL               override the selected model
+  KODEVRA_ENGINE              default execution engine (opencode | codex)
   KODEVRA_SKIP_DOCTOR=1       skip diagnostics
   OPENCODE_BIN                path to the OpenCode executable
   OPENCODE_CONFIG             path to the OpenCode config file
+  KODEVRA_CODEX_BIN           path to the Codex CLI executable
+  CODEX_HOME                  Codex's own config and credential directory
   KODEVRA_STATE               path to Kodevra's provider selection state
 `;
 
@@ -142,6 +162,8 @@ const VALUE_FLAGS = new Set([
   "--reapprove",
   "--timeout",
   "--idle-timeout",
+  "--engine",
+  "--outcome",
 ]);
 const COMMANDS = new Set([
   "doctor",
@@ -153,6 +175,7 @@ const COMMANDS = new Set([
   "providers",
   "auth",
   "sessions",
+  "engines",
 ]);
 
 /**
@@ -179,6 +202,8 @@ function parse(argv) {
     workspace: process.cwd(),
     model: null,
     provider: null,
+    engine: null,
+    outcome: null,
     agent: null,
     auto: false,
     autoExplicit: false,
@@ -236,6 +261,8 @@ function parse(argv) {
     else if (arg === "-w" || arg === "--workspace") opts.workspace = path.resolve(argv[(index += 1)] || "");
     else if (arg === "-m" || arg === "--model") opts.model = argv[(index += 1)];
     else if (arg === "-p" || arg === "--provider") opts.provider = argv[(index += 1)];
+    else if (arg === "--engine") opts.engine = argv[(index += 1)];
+    else if (arg === "--outcome") opts.outcome = argv[(index += 1)];
     else if (arg === "--agent") opts.agent = argv[(index += 1)];
     else if (arg === "--auto") {
       opts.auto = true;
@@ -450,7 +477,7 @@ function planRunEnv(selection, assessment, env = process.env) {
  * command's exit code, not the model's prose, makes this PASS or FAIL. The
  * executor is the host today and says so; it is not sandboxed.
  */
-async function executeRun({ engine, opts, workspace, model, selection, assessment }) {
+async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment }) {
   const startedAt = Date.now();
   const before = workspaceChanges(workspace).files;
   const beforeTree = snapshotTree(workspace);
@@ -471,11 +498,9 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     process.exit(2);
   }
 
-  // Model-requested shell only exists inside the Docker sandbox. The trusted
-  // tool is installed into OpenCode's global tools directory (never the
-  // workspace, which the agent can write) and stays inert unless this run
-  // enables it through the environment below.
-  const sandboxExec = executor.name === "docker";
+  // Model-requested shell only exists inside the Docker sandbox, and only for
+  // OpenCode: Codex brings its own sandbox and does not load OpenCode tools.
+  const sandboxExec = harness === "opencode" && executor.name === "docker";
   let sandboxTool = null;
   if (sandboxExec) {
     try {
@@ -502,14 +527,30 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   // Docker executor, native host bash is denied and sandbox_exec is the only
   // shell the agent has; otherwise bash stays on "ask", which the engine
   // auto-rejects when nobody can approve it.
+  //
+  // Codex is different by design: its sandbox flag is the policy, and Codex
+  // reads neither OPENCODE_CONFIG nor OpenCode tools. Kodevra therefore adds no
+  // overlay for it and keeps the developer's environment untouched.
   let scope;
-  try {
-    scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec });
-  } catch (error) {
-    console.error(color.red(error.message));
-    if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
-    console.error(color.dim("No task was started: the workspace policy could not be enforced."));
-    process.exit(2);
+  if (harness === "codex") {
+    try {
+      codexSandbox(mode.name);
+    } catch (error) {
+      console.error(color.red(error.message));
+      if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+      console.error(color.dim("No task was started."));
+      process.exit(2);
+    }
+    scope = { env: { ...process.env }, warnings: [], cleanup() {} };
+  } else {
+    try {
+      scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec });
+    } catch (error) {
+      console.error(color.red(error.message));
+      if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+      console.error(color.dim("No task was started: the workspace policy could not be enforced."));
+      process.exit(2);
+    }
   }
   if (sandboxExec) {
     Object.assign(scope.env, {
@@ -520,18 +561,31 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
       KODEVRA_RUN_FILE: events.file ?? "",
     });
   }
-  const planEnv = planRunEnv(selection, assessment, scope.env);
-  scope.env = planEnv.env;
-  if (planEnv.stripped) {
-    console.log(
-      `  ${color.dim("plan   ")} ChatGPT plan - OPENAI_API_KEY was not passed to the engine ${color.dim("(no API billing)")}`,
-    );
+  if (harness === "opencode") {
+    const planEnv = planRunEnv(selection, assessment, scope.env);
+    scope.env = planEnv.env;
+    if (planEnv.stripped) {
+      console.log(
+        `  ${color.dim("plan   ")} ChatGPT plan - OPENAI_API_KEY was not passed to the engine ${color.dim("(no API billing)")}`,
+      );
+    }
   }
   if (scope.warnings?.length) {
     for (const warning of scope.warnings) console.log(`  ${color.yellow("scope  ")} ${warning}`);
   }
-  console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; shell needs approval")}`);
-  console.log(`${color.dim("kodevra")} ${color.dim("->")} opencode ${visibleArgs(buildArgs(opts, engineModel(selection), workspace)).join(" ")}`);
+  if (harness === "codex") {
+    if (codexTarget.note) console.log(`  ${color.yellow("model  ")} ${codexTarget.note}`);
+    console.log(
+      `  ${color.dim("scope  ")} ${workspace} ${color.dim(`- codex sandbox ${mode.name === "read-only" ? "read-only" : "workspace-write"}`)}`,
+    );
+  } else {
+    console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; shell needs approval")}`);
+  }
+  console.log(
+    `${color.dim("kodevra")} ${color.dim("->")} ${harness} ${visibleArgs(
+      withProbePrefix(harness, harnessInfo, agentInvocation({ harness, opts, workspace, selection, mode, codexTarget })),
+    ).join(" ")}`,
+  );
   console.log(`${color.dim("mode   ")} ${mode.name} ${color.dim(`- ${mode.description}`)}`);
   if (opts.autoExplicit && opts.auto) {
     console.log(`  ${color.yellow("--auto ignored")} ${color.dim("unattended runs do not auto-approve tool permissions")}`);
@@ -546,6 +600,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   events.emit("run_started", {
     workspace,
     model,
+    harness,
     provider: selection.provider,
     plan: assessment?.plan ?? null,
     mode: mode.name,
@@ -586,6 +641,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   let repairs = 0;
   let approval = null;
   let sandboxCommands = 0;
+  let codexEvidence = null;
 
   // Sandbox commands run inside the engine's process, so Kodevra learns about
   // them by tailing the run's own event file. No extra orchestration.
@@ -605,13 +661,20 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   });
 
   try {
-    events.emit("model_started", { attempt: 0, agent: mode.agent });
-    run = await streamEngine(engine, buildArgs(opts, engineModel(selection), workspace), {
+    events.emit("model_started", { attempt: 0, agent: harness === "codex" ? "codex exec" : mode.agent });
+    run = await streamEngine(harnessInfo.probe, withProbePrefix(harness, harnessInfo, agentInvocation({ harness, opts, workspace, selection, mode, codexTarget })), {
       cwd: workspace,
       env: scope.env,
       timeoutMs: agentTimeoutMs,
       idleMs: agentIdleMs,
+      // Codex's JSONL is evidence, not terminal output; it is rendered compactly
+      // below and kept in the run log.
+      forward: harness !== "codex",
     });
+    if (harness === "codex") {
+      codexEvidence = parseCodexEvents(run.output);
+      for (const line of renderCodexRun(codexEvidence)) console.log(line);
+    }
     if (run.timedOut) {
       events.emit("model_cancelled", {
         attempt: 0,
@@ -630,7 +693,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
 
     if (run.status !== 0) {
       failure = classifyFailure({
-        output: run.output,
+        output: harness === "codex" ? codexFailureText(run, codexEvidence) : run.output,
         status: run.status,
         signal: run.signal,
         timedOut: run.timedOut,
@@ -674,19 +737,31 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
           repairs += 1;
           events.emit("repair_started", { attempt: repairs, max: maxRepairs });
           console.log(`\n  ${color.yellow(`repair ${repairs}/${maxRepairs}`)} ${color.dim("passing the failure back to the model")}`);
-          const repairArgs = buildArgs(
-            { ...opts, continueSession: true, session: null },
-            engineModel(selection),
+          const repairMessage = [
+            repairPrompt({ command: opts.verify, result: verification, attempt: repairs, maxRepairs }),
+          ];
+          const repairArgs = agentInvocation({
+            harness,
+            opts,
             workspace,
-            { message: [repairPrompt({ command: opts.verify, result: verification, attempt: repairs, maxRepairs })] },
-          );
-          events.emit("model_started", { attempt: repairs, agent: mode.agent });
-          run = await streamEngine(engine, repairArgs, {
+            selection,
+            mode,
+            codexTarget,
+            message: repairMessage,
+            repair: true,
+          });
+          events.emit("model_started", { attempt: repairs, agent: harness === "codex" ? "codex exec" : mode.agent });
+          run = await streamEngine(harnessInfo.probe, withProbePrefix(harness, harnessInfo, repairArgs), {
             cwd: workspace,
             env: scope.env,
             timeoutMs: agentTimeoutMs,
             idleMs: agentIdleMs,
+            forward: harness !== "codex",
           });
+          if (harness === "codex") {
+            codexEvidence = parseCodexEvents(run.output);
+            for (const line of renderCodexRun(codexEvidence)) console.log(line);
+          }
           if (run.timedOut) {
             events.emit("model_cancelled", {
               attempt: repairs,
@@ -704,7 +779,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
           });
           if (run.status !== 0) {
             failure = classifyFailure({
-              output: run.output,
+              output: harness === "codex" ? codexFailureText(run, codexEvidence) : run.output,
               status: run.status,
               signal: run.signal,
               timedOut: run.timedOut,
@@ -780,6 +855,30 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     changed_files: changes.files.length,
   });
 
+  const outcome = normalizeOutcome({
+    harness,
+    model,
+    provider: selection.provider,
+    run,
+    verification,
+    failure,
+    approval: approval ? { ...approval, required: true } : null,
+    changes,
+    repairs,
+    maxRepairs,
+    executor,
+    authorization,
+    eventsFile: events.file,
+    startedAt,
+    endedAt: Date.now(),
+    codex: codexEvidence,
+  });
+  events.emit("run_outcome", outcome);
+  if (opts.outcome) {
+    const outcomeFile = writeOutcome(opts.outcome, outcome);
+    console.log(`  ${color.dim("outcome")} ${outcomeFile}`);
+  }
+
   const lines = resultLines({
     model,
     durationMs: Date.now() - startedAt,
@@ -800,7 +899,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   process.exit(ok ? 0 : 1);
 }
 
-function start(engine, args, workspace, env = process.env) {
+function start(engine, args, workspace, env = process.env, hint = "Try: npm i -g opencode-ai") {
   const commandArgs = engine.shell ? [args.map(quoteForShell).join(" ")] : args;
   const child = spawn(engine.command, commandArgs, {
     cwd: workspace,
@@ -811,13 +910,53 @@ function start(engine, args, workspace, env = process.env) {
 
   child.on("error", (error) => {
     console.error(`\n${color.red("Kodevra could not start the engine:")} ${error.message}`);
-    console.error(`  Try: npm i -g opencode-ai`);
+    console.error(`  ${hint}`);
     process.exit(1);
   });
 
   child.on("exit", (code, signal) => {
     process.exit(signal ? 1 : code ?? 0);
   });
+}
+
+/**
+ * A probe that runs the npm-installed package through Node carries prefix
+ * arguments (the codex.js entry point); a PATH shim carries none.
+ */
+function withProbePrefix(harness, harnessInfo, args) {
+  if (harness !== "codex") return args;
+  return [...(harnessInfo.probe?.prefixArgs ?? []), ...args];
+}
+
+/**
+ * Arguments for one harness invocation.
+ *
+ * OpenCode receives Kodevra's workspace hint and agent flags; Codex receives
+ * `codex exec` with its own sandbox flag and the task verbatim, so Kodevra adds
+ * no orchestration around it. Repairs re-run Codex with the failure prompt
+ * (Codex `exec resume` has no sandbox flag, so it is deliberately not used).
+ */
+function agentInvocation({
+  harness,
+  opts,
+  workspace,
+  selection,
+  mode,
+  codexTarget,
+  message = opts.message,
+  repair = false,
+}) {
+  if (harness === "codex") {
+    return buildCodexArgs({
+      mode: mode.name,
+      workspace,
+      target: codexTarget,
+      prompt: message.length ? message.join(" ") : null,
+      interactive: false,
+    });
+  }
+  const callOpts = repair ? { ...opts, continueSession: true, session: null } : opts;
+  return buildArgs(callOpts, engineModel(selection), workspace, { message });
 }
 
 function buildArgs(opts, model, workspace, { message = opts.message } = {}) {
@@ -1302,6 +1441,79 @@ async function runAuth(opts, config, selection, engine) {
   console.log(`  ${color.dim("verify")}  kodevra doctor -p ${target.key}\n`);
 }
 
+/**
+ * `kodevra engines` - the second harness is opt-in, so this surface has to make
+ * the default and the readiness of each engine obvious before a run starts.
+ */
+function enginesCommand(opts, engine) {
+  const sub = (opts.message[0] || "list").toLowerCase();
+
+  if (sub === "use") {
+    const requested = opts.message[1];
+    if (!requested) {
+      console.error(`${color.red("kodevra engines use needs an engine:")} ${HARNESS_NAMES.join(" | ")}`);
+      process.exit(2);
+    }
+    const name = normalizeHarness(requested);
+    const status = harnessStatus(name, { engine });
+    if (!status) {
+      console.error(`${color.red(`Unknown engine "${requested}".`)} Use: ${HARNESS_NAMES.join(" | ")}`);
+      process.exit(2);
+    }
+    if (!status.available) {
+      console.error(`${color.red(`${status.label} is not available: ${status.detail}`)}`);
+      if (status.hint) console.error(`  ${color.yellow("->")} ${status.hint}`);
+      console.error(`  ${color.dim("No engine was selected; the current default is unchanged.")}`);
+      process.exit(1);
+    }
+    const file = writeState({ engine: name });
+    console.log(`  ${color.green("selected")} ${name} ${color.dim(status.detail)}`);
+    console.log(`  ${color.dim(`saved to ${file}; neither OpenCode's nor Codex's config was modified`)}`);
+    if (!status.auth.ok) console.log(`  ${color.yellow("auth")} ${status.auth.hint}`);
+    return;
+  }
+
+  if (sub === "current") {
+    console.log(`  ${color.dim("engine")} ${color.green(activeHarness({ flag: opts.engine }))}`);
+    return;
+  }
+
+  if (sub !== "list") {
+    console.error(`${color.red(`Unknown engines command: ${sub}`)} (list, use, current)`);
+    process.exit(2);
+  }
+
+  const rows = harnessRows({ engine });
+  const active = activeHarness({ flag: opts.engine });
+  const tableHeader = ["engine", "state", "version", "auth"];
+  const cells = (row) => [
+    row.name,
+    row.available ? (row.name === active ? "active" : "available") : "unavailable",
+    row.version ?? "-",
+    row.auth?.detail ?? "-",
+  ];
+  const widths = tableHeader.map((title, column) =>
+    Math.max(title.length, ...rows.map((row) => cells(row)[column].length)),
+  );
+  const line = (values) => values.map((value, column) => String(value).padEnd(widths[column])).join("  ");
+
+  console.log("");
+  console.log(`  ${color.dim(line(tableHeader))}`);
+  for (const row of rows) {
+    const values = line(cells(row));
+    console.log(`  ${row.available ? (row.name === active ? color.green(values) : values) : color.yellow(values)}`);
+  }
+  console.log("");
+  console.log(`  ${color.dim("default")}  opencode ${color.dim("- Codex stays opt-in until the benchmarks justify a switch")}`);
+  console.log(`  ${color.dim("switch")}   kodevra engines use codex   ·   one-off: kodevra run --engine codex \"<task>\"`);
+  for (const row of rows.filter((entry) => !entry.available && entry.hint)) {
+    console.log(`  ${color.yellow("->")} ${row.name}: ${row.hint}`);
+  }
+  if (rows.find((row) => row.name === "codex" && row.available && !row.auth.ok)?.auth?.hint) {
+    console.log(`  ${color.yellow("->")} codex auth: ${rows.find((row) => row.name === "codex").auth.hint}`);
+  }
+}
+
 async function main() {
   let opts;
   try {
@@ -1321,14 +1533,31 @@ async function main() {
   const config = readConfig();
   const engine = findExecutable("opencode");
 
+  let harness;
+  try {
+    harness = activeHarness({ flag: opts.engine });
+  } catch (error) {
+    console.error(color.red(error.message));
+    if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+    process.exit(2);
+  }
+  const harnessInfo = harnessStatus(harness, { engine });
+
   if (opts.command === "version") {
     const selection = activeSelection({ config: config.data, engine });
-    const version = engine
-      ? `${spawnSync(engine.command, ["--version"], { encoding: "utf8", timeout: 20000, shell: engine.shell }).stdout || ""}`.trim()
-      : "not installed";
-    console.log(
-      `${PRODUCT} ${VERSION} · engine opencode ${version || "unknown"} · model ${fullModel(selection)} (${selection.source})`,
-    );
+    const engineVersion =
+      harness === "codex"
+        ? harnessInfo.available
+          ? `codex ${harnessInfo.version || "unknown"}`
+          : "codex not installed"
+        : engine
+          ? `opencode ${`${spawnSync(engine.command, ["--version"], { encoding: "utf8", timeout: 20000, shell: engine.shell }).stdout || ""}`.trim() || "unknown"}`
+          : "opencode not installed";
+    const modelLabel =
+      harness === "codex"
+        ? resolveCodexRun({ selection, explicitModel: Boolean(opts.model), config: harnessInfo.config }).modelLabel
+        : fullModel(selection);
+    console.log(`${PRODUCT} ${VERSION} · engine ${engineVersion} · model ${modelLabel} (${selection.source})`);
     return;
   }
 
@@ -1344,6 +1573,11 @@ async function main() {
     process.exit(result.ok || result.cancelled ? 0 : 1);
   }
 
+  if (opts.command === "engines") {
+    await enginesCommand(opts, engine);
+    return;
+  }
+
   const selection = activeSelection({
     flagModel: opts.model,
     flagProvider: opts.provider,
@@ -1351,6 +1585,16 @@ async function main() {
     engine,
   });
   const assessment = assessProvider(selection.provider, { config: config.data, engine });
+  // Codex has its own provider config and credential store; Kodevra reports the
+  // model Codex will actually use rather than pretending it applied ours.
+  const codexTarget =
+    harness === "codex"
+      ? resolveCodexRun({
+          selection,
+          explicitModel: Boolean(opts.model),
+          config: harnessInfo.config ?? readCodexConfig(),
+        })
+      : null;
 
   if (assessment.kind === "unsupported") {
     console.error(`${color.red(`${assessment.label} is not supported by Kodevra.`)}`);
@@ -1364,7 +1608,7 @@ async function main() {
     console.error(`${color.red(`No model known for provider "${selection.provider}".`)} Use: kodevra providers list`);
     process.exit(2);
   }
-  const model = fullModel(selection);
+  const model = harness === "codex" ? codexTarget.modelLabel : fullModel(selection);
   const workspace = path.resolve(opts.workspace);
 
   if (opts.command === "run" && !opts.message.length) {
@@ -1386,14 +1630,17 @@ async function main() {
     process.exit(2);
   }
 
-  const authLine = assessment.ready
-    ? `${assessment.state} · ${assessment.credential.source}`
-    : `${assessment.state} · ${assessment.detail}`;
+  const authLine =
+    harness === "codex"
+      ? `${harnessInfo.auth.ok ? harnessInfo.auth.state : "needs auth"} · ${harnessInfo.auth.detail}`
+      : assessment.ready
+        ? `${assessment.state} · ${assessment.credential.source}`
+        : `${assessment.state} · ${assessment.detail}`;
   const activeMode = opts.command === "run" || opts.command === "launch" ? `${mode.name} - ${mode.description}` : null;
 
   if (opts.command === "providers") {
     if ((opts.message[0] || "list").toLowerCase() === "list") {
-      console.log(banner({ model, workspace, engine: "opencode", auth: authLine }));
+      console.log(banner({ model, workspace, engine: harness, auth: authLine }));
     }
     await providerCommand(opts, config.data, selection, engine);
     return;
@@ -1401,7 +1648,7 @@ async function main() {
 
   if (opts.command === "auth") {
     if ((opts.message[0] || "status").toLowerCase() === "status") {
-      console.log(banner({ model, workspace, engine: "opencode", auth: authLine }));
+      console.log(banner({ model, workspace, engine: harness, auth: authLine }));
     }
     await runAuth(opts, config.data, selection, engine);
     return;
@@ -1411,11 +1658,11 @@ async function main() {
     header({
       workspace,
       model,
-      provider: assessment.label,
+      provider: harness === "codex" ? `Codex (${codexTarget.source})` : assessment.label,
       auth: authLine,
       sandbox: sandboxStatusLine(),
       mode: activeMode,
-      engine: "opencode",
+      engine: harness,
       hints: opts.command === "launch" || opts.command === "run",
     }),
   );
@@ -1423,6 +1670,12 @@ async function main() {
   // Sessions stay in OpenCode's own local store; Kodevra only makes them
   // reachable from its own command surface (FRD J-06).
   if (opts.command === "sessions") {
+    if (harness === "codex") {
+      console.log(color.dim("  Codex keeps sessions in its own store; Kodevra does not copy them."));
+      console.log(`  ${color.dim("list")}   codex resume --all`);
+      console.log(`  ${color.dim("resume")} codex resume --last`);
+      return;
+    }
     if (!engine) {
       console.error(color.red("OpenCode is not installed. Install it with: npm i -g opencode-ai"));
       process.exit(1);
@@ -1436,7 +1689,7 @@ async function main() {
   const diagnosticsAlways = opts.command === "doctor";
   let failed = 0;
   if (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1")) {
-    const result = await runDiagnostics({ workspace, model });
+    const result = await runDiagnostics({ workspace, model, harness });
     printChecks(result.checks);
     console.log("");
     failed = result.failed;
@@ -1452,18 +1705,37 @@ async function main() {
     process.exit(1);
   }
 
-  if (!engine) {
-    console.error(color.red("OpenCode is not installed. Install it with: npm i -g opencode-ai"));
+  if (!harnessInfo.available) {
+    console.error(color.red(harnessInfo.detail || `${harness} is not installed.`));
+    if (harnessInfo.hint) console.error(`  ${color.yellow("->")} ${harnessInfo.hint}`);
     process.exit(1);
   }
 
   if (opts.command === "run") {
-    await executeRun({ engine, opts, workspace, model, selection, assessment });
+    await executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment });
     return;
   }
 
   if (opts.verify) {
     console.error(`${color.yellow("--verify is only used by kodevra run")} ${color.dim("(the interactive session has no headless result to check)")}`);
+  }
+
+  if (harness === "codex") {
+    const args = [
+      ...(harnessInfo.probe.prefixArgs ?? []),
+      ...buildCodexArgs({
+        mode: mode.name,
+        workspace,
+        target: codexTarget,
+        prompt: opts.message.length ? opts.message.join(" ") : null,
+        interactive: true,
+        extra: opts.passthrough,
+      }),
+    ];
+    console.log(`${color.dim("kodevra")} ${color.dim("->")} codex ${visibleArgs(args).join(" ")}`);
+    console.log("");
+    start(harnessInfo.probe, args, workspace, process.env, harnessInfo.hint || "Install Codex: npm i -g @openai/codex");
+    return;
   }
 
   const args = buildArgs(opts, engineModel(selection), workspace);

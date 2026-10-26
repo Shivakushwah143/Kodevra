@@ -1,0 +1,7 @@
+{
+  "id": "03-refactor-extract-validators",
+  "title": "Extract reusable signup validators",
+  "category": "refactoring",
+  "prompt": "The signup rules are buried inline in validateSignup, so they cannot be reused by the profile form. Extract validateEmail and validatePassword into a new src/validators.js, each returning the error message string or null for valid input, and have src/signup.js compose them into the same errors array in the same field order. Every message and the validateSignup API must stay exactly as they are. Do not edit the tests.",
+  "verify": "npm test"
+}

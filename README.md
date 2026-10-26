@@ -383,6 +383,27 @@ pilot is blocked by the local proxy account entering cooldown; `benchmarks/resul
 attempted runs as infrastructure failures rather than as a model comparison, and the reasons are documented in
 `benchmarks/README.md`. Do not read it as evidence that either agent is better.
 
+### Second engine: Codex (opt-in)
+
+`--engine codex` runs the official open-source Codex CLI through its documented `codex exec --json` interface.
+OpenCode remains the default. Kodevra adds no agent loop: Codex owns planning, tools, its sandbox and its sessions;
+Kodevra owns launch, the verification gate, bounded repair and the normalised outcome.
+
+```bash
+kodevra engines                     # readiness of both engines
+kodevra engines use codex           # persist the choice (kodevra engines use opencode to revert)
+kodevra run --engine codex --verify "npm test" "<task>"
+kodevra doctor --engine codex       # Codex install, auth, config, sandbox and provider reachability
+kodevra run --engine codex --outcome outcome.json "<task>"
+
+node benchmarks/codex/runner.js --check    # 5 scenario fixtures
+node benchmarks/codex/runner.js --all      # kodevra --engine codex vs the official CLI
+```
+
+Codex has its own credentials and provider configuration (`~/.codex`); Kodevra never imports them into OpenCode or
+vice versa, and never reads a credential value. See `docs/CODEX_BENCHMARK.md` for the integration contract, the
+five benchmark scenarios, the real results and the current blockers.
+
 ## Layout
 
 | Path | Purpose |
@@ -393,6 +414,10 @@ attempted runs as infrastructure failures rather than as a model comparison, and
 | `lib/auth.js` | delegates sign-in to OpenCode and verifies credential presence only |
 | `lib/doctor.js` | startup diagnostics (node, engine, config, provider, model, auth, proxy, workspace) |
 | `lib/engine.js` | streams the engine, captures its tail, runs the verification command |
+| `lib/harness.js` | execution-engine registry and selection (OpenCode default, Codex opt-in) |
+| `lib/codex.js` | Codex CLI adapter: discovery, auth presence, flag translation, JSONL evidence |
+| `lib/outcome.js` | `kodevra.outcome/1` normalised result (`--outcome`, `run_outcome` event) |
+| `lib/executable.js` | shared PATH executable resolver |
 | `lib/verify.js` | workspace-scoped git + metadata evidence, failure signatures, repair prompt, completion summary |
 | `lib/progress.js` | tails the run's JSONL events to print live sandbox command progress |
 | `lib/onboarding.js` | guided `kodevra init`: detection, provider choice, consent, safe defaults |
@@ -408,6 +433,7 @@ attempted runs as infrastructure failures rather than as a model comparison, and
 | `lib/events.js` | JSONL execution events for a future branded terminal interface |
 | `lib/brand.js` | wordmark, tagline, colour |
 | `benchmarks/` | 20-task comparison harness, fixtures, runner and recorded results |
+| `benchmarks/codex/` | 5-scenario Codex suite: `kodevra --engine codex` vs the official CLI |
 | `test/` | Node built-in tests: taxonomy, verification, sandboxing, branding, progress, onboarding |
 | `docs/IMPLEMENTATION_STATUS.md` | FRD coverage by requirement ID |
 | `AGENTS.md` | engineering instructions picked up by OpenCode's `AGENTS.md` mechanism |

@@ -10,6 +10,14 @@ continue to apply to their own code.
 - Project: https://opencode.ai
 - Installed as a separate CLI (`opencode-ai`); not included in this repository.
 
+## Codex CLI
+
+- Role: optional second execution engine - agent loop, tools, sandbox, sessions
+- License: Apache-2.0
+- Project: https://github.com/openai/codex
+- Installed as a separate CLI (`@openai/codex`); not included in this repository. Kodevra invokes its documented
+  `codex exec --json` interface and does not modify or vendor it.
+
 ## FreeDeepseekAPI
 
 - Role: OpenAI-compatible proxy that connects OpenCode to DeepSeek

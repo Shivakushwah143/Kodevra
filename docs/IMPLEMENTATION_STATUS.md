@@ -4,8 +4,10 @@ Source of truth: `Kodevra_Master_FRD_v1.1.md`. This file records what the code a
 intends. Status values: **IMPLEMENTED**, **PARTIAL**, **MISSING**, **BLOCKED**, **DEFERRED**. Evidence points at the
 file and the command that produced the observation.
 
-Architecture rule unchanged: OpenCode is the only tool-execution owner. Kodevra is the brand, setup, selection,
-diagnostics, verification-reporting and failure-classification layer. Nothing here adds a second agent loop.
+Architecture rule: exactly one tool-execution owner per run - the selected harness. OpenCode is the default and the
+baseline; the official Codex CLI is an opt-in second engine (`--engine codex`, `kodevra engines use codex`), driven
+through its documented `codex exec --json` interface. Kodevra remains the brand, setup, selection, diagnostics,
+verification-reporting and failure-classification layer. Nothing here adds a second agent loop.
 
 ## P0 — prototype
 
@@ -497,7 +499,7 @@ local provider is in cooldown.
 
 ```bash
 node bin/kodevra.js doctor                  # all PASS expected
-npm test                                    # Kodevra units (60)
+npm test                                    # Kodevra units (103)
 node bin/kodevra.js run -w examples/agent-smoke --verify "npm test" "<task>"
 node bin/kodevra.js run --verify "npm test" --events-json "<task>"   # events on stderr too
 node bin/kodevra.js run --verify "npm test" --executor docker "<task>"  # isolated verification
@@ -513,7 +515,41 @@ node bin/kodevra.js auth status              # credential source, plan, expiry
 node bin/kodevra.js providers use openai/<model>   # only models the engine lists
 node benchmarks/runner.js --validate        # 20 manifests
 node benchmarks/runner.js --check           # 20/20 fixtures sound
+node bin/kodevra.js engines                 # OpenCode (default) and Codex readiness
+node bin/kodevra.js doctor --engine codex   # Codex install, auth, config, sandbox, provider
+node bin/kodevra.js run --engine codex --verify "npm test" --outcome run.json "<task>"
+node benchmarks/codex/runner.js --check     # 5/5 Codex scenarios sound
+node benchmarks/codex/runner.js --all       # adapter vs the official Codex CLI
 ```
+
+## Second harness (Codex, opt-in)
+
+`lib/harness.js` keeps OpenCode as the default and Codex as an explicit choice (`--engine codex`, `KODEVRA_ENGINE`,
+or `kodevra engines use codex` in `~/.kodevra/state.json`). `lib/codex.js` drives the official CLI's documented
+`codex exec --json` interface; it does not use the experimental app-server or add the SDK. Codex owns its agent loop,
+tools, sandbox, approvals and sessions, and keeps its own credentials (`~/.codex`) and provider configuration.
+Kodevra only launches it, applies its existing verification gate and bounded repair, and records the normalised
+`kodevra.outcome/1` result.
+
+Observed on this machine (2026-10-26): Codex CLI 0.149.1, ChatGPT sign-in, `openai/gpt-5.6-terra`.
+`kodevra run --engine codex --verify "npm test"` fixed `benchmarks/codex/tasks/01-bugfix-invoice-tax` in 306.1 s,
+changed one file, and the hidden acceptance test passed (`verified`); the official CLI passed the same scenario in
+127.8 s. The remaining four scenarios were rate-limited by the ChatGPT account after that, so no pass rate is
+claimed. The local DeepSeek proxy was down, so Codex was not exercised on the project's default provider.
+
+## Codex limitations
+
+- The npm-global Codex install on this machine is incomplete (`@openai/codex-win32-x64` missing). Kodevra reports
+  this and points at `npm i -g @openai/codex@latest`; the benchmark used a throwaway install via
+  `KODEVRA_CODEX_BIN`, which is not committed.
+- Codex's `codex exec` has no per-tool approval prompt, so `--mode ask` is refused for non-interactive runs rather
+  than silently mapped to `workspace-write`.
+- On Windows, Codex's default sandbox blocks shell tools and can exit 0 after doing nothing. The official fix is
+  `[windows] sandbox = "elevated"` in Codex's own `config.toml`; Kodevra checks for it and never edits the file.
+- `codex exec resume` has no sandbox flag, so Kodevra's repair prompt starts a new `codex exec` instead of
+  continuing the Codex thread.
+- Codex sessions are Codex's own; `kodevra sessions --engine codex` points at `codex resume` and does not index them.
+- ChatGPT usage limits blocked the remaining benchmark scenarios; they are a quota failure, not a harness result.
 
 The scoping checks were run in a disposable workspace and removed afterwards; to repeat them, create a scratch
 directory containing a file, then ask `kodevra run -w <scratch>` to read a system file, write outside the scratch

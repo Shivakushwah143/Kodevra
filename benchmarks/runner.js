@@ -1,13 +1,21 @@
 #!/usr/bin/env node
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
 
-import { readConfig, providerEntry } from "../lib/config.js";
 import { findExecutable } from "../lib/doctor.js";
 import { snapshotTree, treeChangedFiles } from "../lib/verify.js";
+import {
+  applyAcceptance,
+  applySolution,
+  hashTree,
+  listFiles,
+  loadTasks as loadTaskFixtures,
+  resetProviderSession,
+  resetWorkspace,
+  run,
+  tail,
+} from "./lib/fixtures.js";
 
 /**
  * Kodevra coding benchmarks.
@@ -88,140 +96,13 @@ function parse(argv) {
 }
 
 function loadTasks() {
-  const entries = fs.readdirSync(TASKS_DIR, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-  return entries
-    .map((entry) => {
-      const dir = path.join(TASKS_DIR, entry.name);
-      const manifest = JSON.parse(fs.readFileSync(path.join(dir, "task.json"), "utf8"));
-      return {
-        ...manifest,
-        dir,
-        template: path.join(dir, "template"),
-        acceptance: path.join(dir, "acceptance"),
-        solution: path.join(dir, "solution"),
-      };
-    })
-    .sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function copyDir(source, destination) {
-  fs.mkdirSync(destination, { recursive: true });
-  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
-    const from = path.join(source, entry.name);
-    const to = path.join(destination, entry.name);
-    if (entry.isDirectory()) copyDir(from, to);
-    else if (entry.isFile()) fs.copyFileSync(from, to);
-  }
-}
-
-function resetWorkspace(task, destination) {
-  fs.rmSync(destination, { recursive: true, force: true });
-  copyDir(task.template, destination);
-  // Its own git root: the engine's project root becomes this workspace, so
-  // Kodevra's workspace-scoped permission overlay cannot widen to the machine.
-  spawnSync("git", ["init", "-q"], { cwd: destination, stdio: "ignore" });
-}
-
-function applyAcceptance(task, workspace) {
-  const files = fs.readdirSync(task.acceptance).filter((file) => file.endsWith(".test.js"));
-  for (const file of files) {
-    fs.copyFileSync(path.join(task.acceptance, file), path.join(workspace, "test", file));
-  }
-  return files;
-}
-
-function applySolution(task, workspace) {
-  if (!fs.existsSync(task.solution)) return 0;
-  const before = snapshotTree(workspace);
-  copyDir(task.solution, workspace);
-  return treeChangedFiles(before, workspace).length;
-}
-
-/**
- * Spawn with a hard timeout that kills the whole process tree. A CLI that
- * leaves an orphaned engine behind would keep the proxy chat lock and poison
- * every later run, so killing the tree is part of the measurement, not polish.
- */
-function run(command, args, { cwd, timeout, shell = false }) {
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    let output = "";
-    let timedOut = false;
-    let settled = false;
-
-    const child = spawn(command, args, {
-      cwd,
-      timeout,
-      shell,
-      env: { ...process.env, KODEVRA_SKIP_DOCKER_PROBE: "1", CI: "1", NO_COLOR: "1" },
-    });
-
-    const finish = (status, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        status: timedOut ? 124 : status ?? 1,
-        signal: signal ?? null,
-        timedOut,
-        output,
-        durationMs: Date.now() - startedAt,
-      });
-    };
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      if (process.platform === "win32") {
-        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-      } else {
-        child.kill("SIGKILL");
-      }
-      finish(124, null);
-    }, timeout);
-
-    child.stdout.on("data", (chunk) => {
-      output += chunk.toString();
-      if (output.length > 4_000_000) output = output.slice(-4_000_000);
-    });
-    child.stderr.on("data", (chunk) => {
-      output += chunk.toString();
-      if (output.length > 4_000_000) output = output.slice(-4_000_000);
-    });
-    child.on("error", (error) => {
-      output += `\n${error.message}`;
-      finish(1, null);
-    });
-    child.on("close", (status, signal) => finish(status, signal));
-  });
+  return loadTaskFixtures(TASKS_DIR);
 }
 
 function opencodeCommand() {
   const engine = findExecutable("opencode");
   if (!engine) throw new Error("opencode is not on PATH; install it with: npm i -g opencode-ai");
   return engine;
-}
-
-/**
- * The local DeepSeek proxy is sticky per client. Every CLI run here is the same
- * unkeyed client, so without a reset one benchmark task would see the previous
- * task's conversation - and the two variants would share memory. Reset the
- * proxy chat before each run so task state is genuinely fresh.
- */
-async function resetProviderSession(model) {
-  const provider = `${model}`.split("/")[0];
-  const entry = providerEntry(readConfig().data, provider);
-  const baseURL = entry?.options?.baseURL;
-  if (!baseURL || !/localhost|127\.0\.0\.1|\[::1\]/.test(baseURL)) return { ok: false, reason: "no local proxy" };
-  try {
-    const origin = baseURL.replace(/\/v1\/?$/, "").replace(/\/$/, "");
-    const response = await fetch(`${origin}/reset-session?agent=all&history=drop`, {
-      method: "POST",
-      signal: AbortSignal.timeout(10_000),
-    });
-    return { ok: response.ok, reason: `HTTP ${response.status}` };
-  } catch (error) {
-    return { ok: false, reason: error.message };
-  }
 }
 
 function buildAgent(variant, task, workspace, options) {
@@ -282,19 +163,6 @@ function providerError(output) {
   return codes.find((code) => output.includes(code)) ?? null;
 }
 
-function tail(text, size = 1500) {
-  return text.length > size ? `...${text.slice(-size)}` : text;
-}
-
-function hashTree(dir) {
-  const hash = crypto.createHash("sha256");
-  for (const file of listFiles(dir).sort()) {
-    hash.update(`${file}\u0000`);
-    hash.update(fs.readFileSync(path.join(dir, file)));
-    hash.update("\u0000");
-  }
-  return hash.digest("hex");
-}
 
 function resultPath(variant, task) {
   return path.join(RAW_DIR, variant, `${task.id}.json`);
@@ -499,17 +367,6 @@ function validateFixtures(tasks) {
     console.log("  all manifests, templates, acceptance tests and solutions are present");
   }
   return problems;
-}
-
-function listFiles(dir, prefix = "") {
-  if (!fs.existsSync(dir)) return [];
-  const out = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const relative = prefix ? `${prefix}${entry.name}` : entry.name;
-    if (entry.isDirectory()) out.push(...listFiles(path.join(dir, entry.name), `${relative}/`));
-    else if (entry.isFile()) out.push(relative);
-  }
-  return out;
 }
 
 /** Fixture integrity: broken without the fix, green with the reference solution. */
