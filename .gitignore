@@ -10,5 +10,6 @@ examples/*/node_modules/
 .kodevra/
 *.tgz
 benchmarks/.work/
+site/dist/
 benchmarks/results/raw/
 
