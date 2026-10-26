@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  assertCredentialFree,
   assertTrustedProject,
   permissionOverlay,
   projectExtensions,
@@ -123,6 +124,33 @@ test("the overlay never copies provider credentials, even from a custom OPENCODE
 
   overlay.cleanup();
   assert.equal(fs.existsSync(overlay.file), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a model token limit may ride along, but provider options and keys may not", () => {
+  const dir = tempRepo();
+  const nested = path.join(dir, "nested", "workspace");
+  const modelConfig = {
+    provider: { openrouter: { models: { "openai/gpt-5.6-terra": { limit: { output: 8192, context: 1050000 } } } } },
+  };
+
+  const overlay = writePermissionOverlay({
+    workspace: nested,
+    mode: "workspace-write",
+    modelConfig,
+    env: { PATH: process.env.PATH },
+  });
+  const data = JSON.parse(fs.readFileSync(overlay.file, "utf8"));
+  assert.equal(data.provider.openrouter.models["openai/gpt-5.6-terra"].limit.output, 8192);
+  assert.equal(data.provider.openrouter.options, undefined);
+  assert.equal(data.permission.bash, "ask");
+  overlay.cleanup();
+
+  assert.throws(
+    () => writePermissionOverlay({ workspace: nested, mode: "workspace-write", modelConfig: { provider: { openrouter: { options: { apiKey: "sk-x" } } } }, env: { PATH: process.env.PATH } }),
+    /can hold a credential/,
+  );
+  assert.throws(() => assertCredentialFree({ provider: { openrouter: { headers: {} } } }), /headers/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

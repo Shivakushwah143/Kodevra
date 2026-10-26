@@ -29,7 +29,15 @@ import {
   treeChangedFiles,
   workspaceChanges,
 } from "../lib/verify.js";
-import { findExecutable, runDiagnostics } from "../lib/doctor.js";
+import { engineVersion, findExecutable, runDiagnostics } from "../lib/doctor.js";
+import {
+  describeProfile,
+  modelConfigBlock,
+  modelProfile,
+  resolveEffort,
+  resolveOutputTokens,
+} from "../lib/model-profile.js";
+import { createTrace } from "../lib/trace.js";
 import { runInit } from "../lib/onboarding.js";
 import {
   adapterInfo,
@@ -95,6 +103,12 @@ ${color.bold("Options")}
                               (default: workspace-write for run, ask for launch)
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
       --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
+      --reasoning <level>     reasoning effort passed to the engine (--variant); validated against the
+                              model catalog, e.g. low | medium | high | xhigh
+      --output-tokens <n>     cap the model's output budget for this run (OpenCode model limit);
+                              aggregators reserve it up front, so a small balance needs a cap
+      --trace                 keep the engine's native --format json stream and report steps, tool
+                              calls, tokens and cost for the run
   -c, --continue              continue the last session
   -s, --session <id>          continue a specific session
       --executor <name>       where project commands run: host | docker (default: host)
@@ -142,6 +156,8 @@ const VALUE_FLAGS = new Set([
   "--reapprove",
   "--timeout",
   "--idle-timeout",
+  "--reasoning",
+  "--output-tokens",
 ]);
 const COMMANDS = new Set([
   "doctor",
@@ -197,6 +213,10 @@ function parse(argv) {
     yes: false,
     agentTimeoutMs: null,
     agentIdleMs: null,
+    reasoning: null,
+    reasoningEffort: null,
+    outputTokens: null,
+    trace: false,
     passthrough: [],
     message: [],
   };
@@ -255,6 +275,9 @@ function parse(argv) {
     } else if (arg === "--reapprove") opts.reapprove = argv[(index += 1)] || null;
     else if (arg === "--timeout") opts.agentTimeoutMs = Math.max(1, Number(argv[(index += 1)]) || 0) * 1000;
     else if (arg === "--idle-timeout") opts.agentIdleMs = Math.max(1, Number(argv[(index += 1)]) || 0) * 1000;
+    else if (arg === "--reasoning") opts.reasoning = argv[(index += 1)] || null;
+    else if (arg === "--output-tokens") opts.outputTokens = Number(argv[(index += 1)]) || null;
+    else if (arg === "--trace") opts.trace = true;
     else if (arg === "--events-json") opts.eventsJson = true;
     else if (arg === "-y" || arg === "--yes") opts.yes = true;
     else if (arg === "--no-doctor") opts.doctor = false;
@@ -450,7 +473,7 @@ function planRunEnv(selection, assessment, env = process.env) {
  * command's exit code, not the model's prose, makes this PASS or FAIL. The
  * executor is the host today and says so; it is not sandboxed.
  */
-async function executeRun({ engine, opts, workspace, model, selection, assessment }) {
+async function executeRun({ engine, opts, workspace, model, selection, assessment, modelConfig = null }) {
   const startedAt = Date.now();
   const before = workspaceChanges(workspace).files;
   const beforeTree = snapshotTree(workspace);
@@ -504,7 +527,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   // auto-rejects when nobody can approve it.
   let scope;
   try {
-    scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec });
+    scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec, modelConfig });
   } catch (error) {
     console.error(color.red(error.message));
     if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
@@ -587,6 +610,29 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   let approval = null;
   let sandboxCommands = 0;
 
+  // --trace keeps the engine's own JSON event stream: one line per step, plus the
+  // real token counts and cost the engine reports for itself.
+  const trace = opts.trace ? createTrace() : null;
+  const traceSink = trace
+    ? (line) => {
+        for (const output of trace.ingestLine(line)) if (String(output).trim()) console.log(output);
+      }
+    : null;
+  const runAgent = async (args, attempt) => {
+    if (trace) trace.beginCall();
+    const result = await streamEngine(engine, args, {
+      cwd: workspace,
+      env: scope.env,
+      timeoutMs: agentTimeoutMs,
+      idleMs: agentIdleMs,
+      onLine: traceSink,
+      forwardStdout: !trace,
+    });
+    const metrics = trace ? trace.endCall() : null;
+    if (metrics) events.emit("model_metrics", { attempt, ...metrics });
+    return result;
+  };
+
   // Sandbox commands run inside the engine's process, so Kodevra learns about
   // them by tailing the run's own event file. No extra orchestration.
   const stopProgress = watchRunEvents(events.file, {
@@ -606,12 +652,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
 
   try {
     events.emit("model_started", { attempt: 0, agent: mode.agent });
-    run = await streamEngine(engine, buildArgs(opts, engineModel(selection), workspace), {
-      cwd: workspace,
-      env: scope.env,
-      timeoutMs: agentTimeoutMs,
-      idleMs: agentIdleMs,
-    });
+    run = await runAgent(buildArgs(opts, engineModel(selection), workspace), 0);
     if (run.timedOut) {
       events.emit("model_cancelled", {
         attempt: 0,
@@ -681,12 +722,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
             { message: [repairPrompt({ command: opts.verify, result: verification, attempt: repairs, maxRepairs })] },
           );
           events.emit("model_started", { attempt: repairs, agent: mode.agent });
-          run = await streamEngine(engine, repairArgs, {
-            cwd: workspace,
-            env: scope.env,
-            timeoutMs: agentTimeoutMs,
-            idleMs: agentIdleMs,
-          });
+          run = await runAgent(repairArgs, repairs);
           if (run.timedOut) {
             events.emit("model_cancelled", {
               attempt: repairs,
@@ -794,6 +830,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     approval: approval ? { ...approval, required: true } : null,
     eventsFile: events.file,
     sandboxCommands,
+    metrics: trace ? trace.summary() : null,
   });
   for (const line of lines) console.log(line);
 
@@ -806,7 +843,8 @@ function start(engine, args, workspace, env = process.env) {
     cwd: workspace,
     stdio: "inherit",
     shell: engine.shell,
-    env,
+    // See lib/engine.js: the engine's project root follows PWD.
+    env: { ...env, PWD: workspace },
   });
 
   child.on("error", (error) => {
@@ -825,7 +863,14 @@ function buildArgs(opts, model, workspace, { message = opts.message } = {}) {
   const args = opts.command === "run" ? ["run"] : [];
 
   if (model) args.push("-m", model);
+  // Provider-specific reasoning effort is the engine's own flag: Kodevra only
+  // decides which level to ask for, never how the provider spends it.
+  if (opts.reasoningEffort) args.push("--variant", opts.reasoningEffort);
   if (mode.agent) args.push("--agent", mode.agent);
+  // Machine-readable events, so Kodevra can report the engine's real steps and
+  // token counts instead of estimating them. Headless only: an interactive
+  // session needs the engine's own terminal interface.
+  if (opts.trace && opts.command === "run") args.push("--format", "json");
   if (mode.auto) args.push("--auto");
   // Automated runs never load third-party plugins from the project.
   if (opts.command === "run") args.push("--pure");
@@ -1323,9 +1368,7 @@ async function main() {
 
   if (opts.command === "version") {
     const selection = activeSelection({ config: config.data, engine });
-    const version = engine
-      ? `${spawnSync(engine.command, ["--version"], { encoding: "utf8", timeout: 20000, shell: engine.shell }).stdout || ""}`.trim()
-      : "not installed";
+    const version = engine ? engineVersion(engine).version || "unknown" : "not installed";
     console.log(
       `${PRODUCT} ${VERSION} · engine opencode ${version || "unknown"} · model ${fullModel(selection)} (${selection.source})`,
     );
@@ -1386,6 +1429,34 @@ async function main() {
     process.exit(2);
   }
 
+  // What the catalog says this model actually is. Resolving it here means a typo
+  // in --reasoning costs nothing, and the run does not discover the problem after
+  // the engine has already started.
+  const profile = modelProfile(engineProviderId(selection.provider), selection.model);
+  let effort;
+  try {
+    effort = resolveEffort(profile, opts.reasoning ?? process.env.KODEVRA_REASONING ?? null);
+  } catch (error) {
+    console.error(color.red(error.message));
+    if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+    process.exit(2);
+  }
+  opts.reasoningEffort = effort.effort;
+
+  let modelConfig = null;
+  let outputPlan = { output: null, note: null, source: "model catalog" };
+  if (opts.command === "run" || opts.command === "launch") {
+    outputPlan = resolveOutputTokens(profile, {
+      requested: opts.outputTokens ?? (Number(process.env.KODEVRA_OUTPUT_TOKENS) || null),
+    });
+    modelConfig = modelConfigBlock(profile, { output: outputPlan.output });
+    if (outputPlan.output && !modelConfig) {
+      outputPlan.note =
+        `no output cap applied: the engine catalog has no context window for ${selection.model}, ` +
+        "and OpenCode rejects a partial model limit.";
+    }
+  }
+
   const authLine = assessment.ready
     ? `${assessment.state} · ${assessment.credential.source}`
     : `${assessment.state} · ${assessment.detail}`;
@@ -1420,6 +1491,16 @@ async function main() {
     }),
   );
 
+  if (opts.command === "run" || opts.command === "launch") {
+    const appliedOutput = modelConfig ? outputPlan.output : null;
+    console.log(`  ${color.dim("model   ")} ${describeProfile(profile, { effort: effort.effort, output: appliedOutput })}`);
+    if (effort.warning) console.log(`  ${color.yellow("model   ")} ${effort.warning}`);
+    if (outputPlan.note) console.log(`  ${color.dim("model   ")} ${color.dim(outputPlan.note)}`);
+    if (opts.trace && opts.command === "run") {
+      console.log(`  ${color.dim("trace   ")} engine --format json ${color.dim("steps, tool calls, tokens, cost")}`);
+    }
+  }
+
   // Sessions stay in OpenCode's own local store; Kodevra only makes them
   // reachable from its own command surface (FRD J-06).
   if (opts.command === "sessions") {
@@ -1435,15 +1516,20 @@ async function main() {
 
   const diagnosticsAlways = opts.command === "doctor";
   let failed = 0;
+  let optionalMissing = 0;
   if (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1")) {
     const result = await runDiagnostics({ workspace, model });
     printChecks(result.checks);
     console.log("");
     failed = result.failed;
+    optionalMissing = result.checks.filter((check) => !check.ok && !check.fatal).length;
   }
 
   if (diagnosticsAlways) {
-    console.log(failed ? color.red(`${failed} check(s) failed.`) : color.green("All checks passed."));
+    const warnings = optionalMissing;
+    if (failed) console.log(color.red(`${failed} check(s) failed.`));
+    else if (warnings) console.log(color.yellow(`All required checks passed (${warnings} optional check(s) unavailable).`));
+    else console.log(color.green("All checks passed."));
     process.exit(failed ? 1 : 0);
   }
 
@@ -1458,7 +1544,7 @@ async function main() {
   }
 
   if (opts.command === "run") {
-    await executeRun({ engine, opts, workspace, model, selection, assessment });
+    await executeRun({ engine, opts, workspace, model, selection, assessment, modelConfig });
     return;
   }
 

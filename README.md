@@ -64,6 +64,9 @@ kodevra run "fix the failing test" --verify "npm test"
 kodevra run --verify "npm test" --executor docker "fix it"  # verify inside a container
 kodevra run --verify "npm test" --reapprove <sha256> "fix it"  # approve one exact surface
 kodevra run --verify "npm test" --events-json "fix it" # stream events on stderr
+kodevra run --trace "fix it"        # engine --format json: steps, tool calls, tokens, cost
+kodevra run --reasoning high "fix it"          # provider reasoning effort (--variant), catalog-validated
+kodevra run --output-tokens 16000 "fix it"    # per-run model output budget (aggregators reserve it up front)
 kodevra run -c "and add a test"      # continue the last session
 kodevra sessions                     # list local sessions for this workspace
 kodevra doctor                       # diagnostics only
@@ -240,9 +243,10 @@ Interactive launches (`kodevra <path>`) are unchanged: no tool is enabled there 
 - **Project extensions are untrusted.** A workspace-level `opencode.json` / `.opencode/` can add plugins or change
   permissions, so automated runs refuse it unless you explicitly set `KODEVRA_TRUST_PROJECT_EXTENSIONS=1` after
   reviewing it. Automated runs also pass `--pure`, so third-party plugins do not load.
-- **The overlay never carries credentials.** `OPENCODE_CONFIG` points at a generated file containing `permission` and
-  `$schema` only; provider blocks, API keys and headers are not copied. It is mode `0600` inside a `0700` directory
-  and removed on every exit path.
+- **The overlay never carries credentials.** `OPENCODE_CONFIG` points at a generated file containing `permission`,
+  `$schema` and - only when the selected model needs one - that model's `limit` block. Provider options, API keys and
+  headers are not copied, and `assertCredentialFree` refuses them by name. It is mode `0600` inside a `0700`
+  directory and removed on every exit path.
 - **Agent calls are bounded.** `--timeout` (default 1800 s) and `--idle-timeout` (default 300 s) cancel the whole
   process tree on Windows and POSIX, emit `model_cancelled`, and are reported as `TIMEOUT` rather than a test failure.
 - **Logs are redacted and short-lived.** Event payloads pass through a credential redactor before they are written;
@@ -259,7 +263,7 @@ stderr so a terminal UI can consume them without scraping coloured output:
 {"run_id":"run_20261025-081817_7aa326","ts":"2026-10-25T08:18:17.004Z","event":"verification_finished","command":"npm test","executor":"host","sandboxed":false,"status":0,"ok":true,"timed_out":false,"duration_ms":940}
 ```
 
-Events cover `run_started`, `model_started/finished`, `file_changes`, `verification_authorized`,
+Events cover `run_started`, `model_started/finished`, `model_metrics`, `file_changes`, `verification_authorized`,
 `verification_reapproved`, `approval_required`, `verification_started/finished`, `verification_skipped`,
 `sandbox_started/finished`, `repair_started`, `failure` and `run_finished`. They carry metadata only - no prompts,
 file contents or credentials.
@@ -410,6 +414,7 @@ attempted runs as infrastructure failures rather than as a model comparison, and
 | `benchmarks/` | 20-task comparison harness, fixtures, runner and recorded results |
 | `test/` | Node built-in tests: taxonomy, verification, sandboxing, branding, progress, onboarding |
 | `docs/IMPLEMENTATION_STATUS.md` | FRD coverage by requirement ID |
+| `docs/OPENCODE_OPTIMIZATION.md` | harness audit: model settings, startup, tracing, measurements and blockers |
 | `AGENTS.md` | engineering instructions picked up by OpenCode's `AGENTS.md` mechanism |
 | `examples/agent-smoke` | disposable project with one failing test, used to prove the agent works |
 

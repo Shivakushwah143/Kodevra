@@ -83,12 +83,19 @@ test("a verified run reports the real command and exit code", () => {
 
 test("file metadata speaks for workspaces git cannot see", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-tree-"));
+  const baselineAt = new Date(Date.now() - 5_000);
   fs.mkdirSync(path.join(dir, "src"));
   fs.writeFileSync(path.join(dir, "src", "a.js"), "one\n", "utf8");
+  // The snapshot compares size and mtime, so give the rewrite a later timestamp
+  // explicitly: two writes inside one system clock tick carry the same mtime on
+  // Windows, and a model run is minutes apart, never microseconds.
+  fs.utimesSync(path.join(dir, "src", "a.js"), baselineAt, baselineAt);
   const baseline = snapshotTree(dir);
 
   fs.writeFileSync(path.join(dir, "src", "a.js"), "two\n", "utf8");
   fs.writeFileSync(path.join(dir, "src", "b.js"), "new\n", "utf8");
+  const later = new Date();
+  fs.utimesSync(path.join(dir, "src", "a.js"), later, later);
 
   const changed = treeChangedFiles(baseline, dir);
   assert.deepEqual(changed, ["src/a.js", "src/b.js"]);

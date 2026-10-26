@@ -48,6 +48,40 @@ test("an expired ChatGPT session names the sign-in again", () => {
   assert.match(failure.action, /kodevra auth login openai/);
 });
 
+test('an expired key is not answered with "sign in again"', () => {
+  const failure = classifyFailure({
+    output:
+      '{"type":"error","error":{"name":"APIError","data":{"message":"This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.","statusCode":401}}}',
+    status: 1,
+    provider: "opencode",
+  });
+  assert.equal(failure.code, "AUTH_EXPIRED");
+  assert.match(failure.action, /Create a new key/);
+  assert.match(failure.action, /does not renew an expired key/);
+});
+
+test("a rejected run config is named as an engine config failure", () => {
+  const failure = classifyFailure({
+    output:
+      "Error: Configuration is invalid at C:\\Users\\dev\\.kodevra\\run\\opencode-1.json\n↳ Missing key provider.openrouter.models.x.limit.context",
+    status: 1,
+  });
+  assert.equal(failure.code, "CONFIG_INVALID");
+  assert.equal(failure.origin, "engine");
+});
+
+test("a balance that cannot reserve max_tokens names the output budget", () => {
+  const failure = classifyFailure({
+    output:
+      '{"type":"error","error":{"data":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 32000 tokens, but can only afford 2619.","statusCode":402}}}}',
+    status: 1,
+    provider: "openrouter",
+  });
+  assert.equal(failure.code, "RATE_LIMITED");
+  assert.match(failure.action, /--output-tokens 2095/);
+  assert.match(failure.message, /reserve the output budget/);
+});
+
 test("a ChatGPT usage limit stays a rate limit, not a code failure", () => {
   assert.equal(classifyFailure({ output: "usage_limit_reached", status: 1 }).code, "RATE_LIMITED");
 });
