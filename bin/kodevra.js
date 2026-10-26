@@ -40,7 +40,7 @@ import {
   renderCodexRun,
   resolveCodexRun,
 } from "../lib/codex.js";
-import { normalizeSpeed, planFastSpeed } from "../lib/codex-catalog.js";
+import { bundledCatalog, normalizeSpeed, planFastSpeed } from "../lib/codex-catalog.js";
 import { HARNESS_NAMES, activeHarness, harnessRows, harnessStatus, normalizeHarness } from "../lib/harness.js";
 import { normalizeOutcome, writeOutcome } from "../lib/outcome.js";
 import { runInit } from "../lib/onboarding.js";
@@ -313,13 +313,28 @@ function parse(argv) {
   return opts;
 }
 
-/** One line of sandbox truth for the startup panel: probe only, never pull. */
-function sandboxStatusLine() {
+/**
+ * One line of sandbox truth for the startup panel: probe only, never pull.
+ *
+ * Docker is only part of a run that will actually use it. With the host executor
+ * nothing is containerised - and probing anyway costs 200-400 ms on a machine
+ * where the engine is stopped, for a line the user cannot act on. `null` means
+ * "the default executor decides" (`--verify` without `--executor`), which is the
+ * one case where the answer is about to matter.
+ */
+function sandboxStatusLine(executorName = "host") {
   if (process.env.KODEVRA_SKIP_DOCKER_PROBE === "1") return color.dim("probe skipped");
+  if (executorName !== "docker" && executorName !== null) return color.dim("host executor - nothing containerised");
   const probe = probeDocker();
   return probe.ok
     ? color.green(probe.detail)
     : `${color.yellow("unavailable")}${color.dim(` · ${probe.detail}`)}`;
+}
+
+/** Which executor `executeRun` will use, without paying a Docker probe to know. */
+function executorNameForDisplay(opts) {
+  if (opts.executor) return String(opts.executor).toLowerCase();
+  return opts.verify ? null : "host";
 }
 
 /**
@@ -672,6 +687,7 @@ async function executeRun({
   if (opts.verify) {
     try {
       authorization = createVerificationAuthorization({ workspace, command: opts.verify });
+      timings.mark("authorization");
     } catch (error) {
       console.error(`\n  ${color.red("authorization unavailable")} ${error.message}`);
       console.error(`  ${color.yellow("->")} ${error.code === "AUTHORIZATION_SURFACE_TOO_LARGE" ? "narrow the test scope (a single test directory is enough) and retry." : "fix file permissions in the workspace and retry."}`);
@@ -732,6 +748,9 @@ async function executeRun({
 
   let run = { status: 1, signal: null, output: "", durationMs: 0 };
   let failure = null;
+  // The post-agent git view is computed once and reused by the outcome, instead
+  // of asking git the same question twice in one run.
+  let changesAfterRun = null;
 
   let verification = null;
   let repairs = 0;
@@ -814,7 +833,7 @@ async function executeRun({
       events.emit("failure", { code: failure.code, origin: failure.origin, message: failure.message });
       events.emit("verification_skipped", { reason: "model execution failed" });
     }
-    emitFileChanges(events, workspace);
+    changesAfterRun = emitFileChanges(events, workspace);
 
     if (opts.verify && !failure) {
       let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
@@ -945,7 +964,7 @@ async function executeRun({
     stopSpeed();
   }
 
-  const changes = workspaceChanges(workspace);
+  const changes = changesAfterRun ?? workspaceChanges(workspace);
   timings.mark("changes");
   // Git speaks for tracked files; a workspace inside an ignored directory gets
   // its evidence from the file-metadata snapshot instead of claiming zero.
@@ -1673,6 +1692,7 @@ async function main() {
   }
 
   const config = readConfig();
+  timings.mark("config");
   const engine = findExecutable("opencode");
 
   let harness;
@@ -1729,7 +1749,19 @@ async function main() {
     config: config.data,
     engine,
   });
-  const assessment = assessProvider(selection.provider, { config: config.data, engine });
+  timings.mark("selection");
+  // Provider assessment exists for OpenCode's credential and model plumbing. A
+  // Codex run only needs it for the unsupported-provider guard and the plan, yet
+  // the full assessment is expensive: it parses OpenCode's ~6 MB model catalog
+  // and, for an account provider, asks OpenCode to enumerate its models in a
+  // child process (`opencode models openai`, 4-5 s here) - neither of which is a
+  // fact about a Codex run. Ask for neither. `kodevra providers`, `kodevra auth
+  // status` and `kodevra doctor` still do the full assessment.
+  const assessment = assessProvider(
+    selection.provider,
+    harness === "codex" ? { config: config.data, catalog: null, liveModels: null } : { config: config.data, engine },
+  );
+  timings.mark("assessment");
   // Codex has its own provider config and credential store; Kodevra reports the
   // model Codex will actually use rather than pretending it applied ours.
   const codexTarget =
@@ -1757,10 +1789,20 @@ async function main() {
       console.error(`${color.red("--speed fast is a Codex option.")} ${color.dim("OpenCode has no service tier to select.")}`);
       process.exit(2);
     }
+    // Two CLI calls per fast run are one too many. The bundled catalog is
+    // version-derived and cached by binary identity; and when Codex's config
+    // names no custom catalog and no profile, the catalog it reports *is* the
+    // bundled one (verified byte-for-byte against a clean CODEX_HOME), so the
+    // effective view does not need a second launch.
+    const bundled = bundledCatalog(harnessInfo.probe).catalog;
+    timings.mark("speed_bundled");
+    const customCatalog = Boolean(harnessInfo.config?.modelCatalogJson || harnessInfo.config?.profile);
+    const user = customCatalog ? readCodexCatalog(harnessInfo.probe) : bundled;
+    timings.mark("speed_catalog");
     const plan = planFastSpeed({
       model: codexTarget.model ?? harnessInfo.config?.model ?? null,
-      bundled: readCodexCatalog(harnessInfo.probe, { bundled: true }),
-      user: readCodexCatalog(harnessInfo.probe),
+      bundled,
+      user,
     });
     if (!plan.ok) {
       console.error(`\n  ${color.red(plan.code)} ${plan.message}`);
@@ -1771,6 +1813,7 @@ async function main() {
     codexSpeed = plan.evidence;
     speedConfig = plan.config;
     stopSpeed = plan.cleanup;
+    timings.mark("speed");
     // The merged catalog is a temporary file for this invocation; it must not
     // outlive the process even on an early exit.
     process.once("exit", stopSpeed);
@@ -1810,9 +1853,20 @@ async function main() {
     process.exit(2);
   }
 
+  // The startup panel follows the same effective provider as doctor: an
+  // explicit OpenAI run is signed in with ChatGPT, not with whatever provider
+  // Codex's config.toml happens to name.
+  const codexAuthLine = (() => {
+    const auth = harnessInfo.auth;
+    if (codexTarget?.provider !== "openai") return `${auth.ok ? auth.state : "needs auth"} · ${auth.detail}`;
+    if (auth.state === "chatgpt") return "chatgpt · ChatGPT sign-in";
+    if (auth.state === "api-key") return "api-key · API key stored by codex login";
+    if (auth.state === "stored") return "stored · auth.json present (not read)";
+    return `${auth.ok ? auth.state : "needs auth"} · ${auth.detail}`;
+  })();
   const authLine =
     harness === "codex"
-      ? `${harnessInfo.auth.ok ? harnessInfo.auth.state : "needs auth"} · ${harnessInfo.auth.detail}`
+      ? codexAuthLine
       : assessment.ready
         ? `${assessment.state} · ${assessment.credential.source}`
         : `${assessment.state} · ${assessment.detail}`;
@@ -1840,7 +1894,7 @@ async function main() {
       model,
       provider: harness === "codex" ? `Codex (${codexTarget.source})` : assessment.label,
       auth: authLine,
-      sandbox: sandboxStatusLine(),
+      sandbox: sandboxStatusLine(executorNameForDisplay(opts)),
       mode: activeMode,
       engine: harness,
       hints: opts.command === "launch" || opts.command === "run",
@@ -1867,9 +1921,24 @@ async function main() {
   }
 
   const diagnosticsAlways = opts.command === "doctor";
+  // The executor this invocation will really use, including the implicit
+  // Docker choice `--verify` makes when no executor was named.
+  const diagnosticExecutor = opts.executor || process.env.KODEVRA_EXECUTOR || (opts.verify ? "docker" : "host");
   let failed = 0;
   if (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1")) {
-    const result = await runDiagnostics({ workspace, model, harness });
+    const result = await runDiagnostics({
+      workspace,
+      model,
+      harness,
+      // Reuse the status, target and config this process already resolved: no
+      // second `codex --version` / `codex login status` / config read.
+      codexStatus: harnessInfo,
+      codexTarget,
+      executor: diagnosticExecutor,
+      config,
+      purpose: diagnosticsAlways ? "doctor" : "run",
+    });
+    timings.mark("diagnostics");
     printChecks(result.checks);
     console.log("");
     failed = result.failed;

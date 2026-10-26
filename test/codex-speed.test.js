@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  bundledCatalog,
+  catalogCacheDir,
+  catalogCacheKey,
   catalogSource,
   FAST_SERVICE_TIER,
   findModel,
@@ -232,5 +235,122 @@ test("a catalog that cannot be written refuses fast mode instead of throwing", (
     fs.rmSync(process.env.KODEVRA_TMPDIR, { force: true });
     if (previous === undefined) delete process.env.KODEVRA_TMPDIR;
     else process.env.KODEVRA_TMPDIR = previous;
+  }
+});
+
+// --- bundled catalog cache -------------------------------------------------
+// `codex debug models --bundled` is a process launch for version-derived data, so
+// fast mode remembers it. These tests pin the invalidation rule and the promise
+// that only model metadata is ever written.
+
+function cacheFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-catalog-cache-"));
+  const stat = () => ({ size: 41, mtimeMs: 1_700_000_000_000 });
+  const probe = { ok: true, command: path.join(dir, "codex.exe"), version: "0.149.1", prefixArgs: [], shell: false };
+  return { dir, probe, stat };
+}
+
+test("the bundled catalog is asked for once and then read from the cache", () => {
+  const { dir, probe, stat } = cacheFixture();
+  let calls = 0;
+  const readCatalog = () => {
+    calls += 1;
+    return BUNDLED;
+  };
+  const env = { KODEVRA_CACHE_DIR: dir };
+
+  const first = bundledCatalog(probe, { env, readCatalog, stat });
+  assert.equal(first.source, "codex");
+  assert.equal(calls, 1);
+
+  const second = bundledCatalog(probe, { env, readCatalog, stat });
+  assert.equal(second.source, "cache");
+  assert.equal(calls, 1, "the CLI is not launched again");
+  assert.deepEqual(second.catalog, BUNDLED);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a new Codex version, size or mtime invalidates the cached catalog", () => {
+  const { dir, probe, stat } = cacheFixture();
+  const env = { KODEVRA_CACHE_DIR: dir };
+  let calls = 0;
+  const readCatalog = () => {
+    calls += 1;
+    return BUNDLED;
+  };
+
+  bundledCatalog(probe, { env, readCatalog, stat });
+  bundledCatalog({ ...probe, version: "0.150.0" }, { env, readCatalog, stat });
+  assert.equal(calls, 2, "a different version is a different catalog");
+
+  bundledCatalog({ ...probe, version: "0.149.1" }, { env, readCatalog, stat: () => ({ size: 99, mtimeMs: 1 }) });
+  assert.equal(calls, 3, "a replaced binary is a different catalog");
+
+  bundledCatalog({ ...probe, version: "0.149.1" }, { env, readCatalog, stat });
+  assert.equal(calls, 3, "the original binary still hits its own cache");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the cache holds model metadata only, never a credential", () => {
+  const { dir, probe, stat } = cacheFixture();
+  const env = { KODEVRA_CACHE_DIR: dir };
+  bundledCatalog(probe, { env, readCatalog: () => BUNDLED, stat });
+
+  const files = fs.readdirSync(dir).filter((name) => name.startsWith("codex-bundled-catalog-"));
+  assert.equal(files.length, 1);
+  const text = fs.readFileSync(path.join(dir, files[0]), "utf8");
+  assert.match(text, /gpt-5\.6-terra/);
+  for (const forbidden of ["api_key", "apiKey", "token", "secret", "password", "OPENAI_API_KEY"]) {
+    assert.equal(text.includes(forbidden), false, `cache must not contain ${forbidden}`);
+  }
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a corrupt or unreadable cache falls back to the CLI instead of failing", () => {
+  const { dir, probe, stat } = cacheFixture();
+  const env = { KODEVRA_CACHE_DIR: dir };
+  // The cache file name is a hash, so seed the CLI read first and then corrupt
+  // whatever it wrote.
+  bundledCatalog(probe, { env, readCatalog: () => BUNDLED, stat });
+  for (const name of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, name), "{not json", "utf8");
+
+  const result = bundledCatalog(probe, { env, readCatalog: () => BUNDLED, stat });
+  assert.equal(result.source, "codex");
+  assert.deepEqual(result.catalog, BUNDLED);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an unwritable cache directory still yields the catalog", () => {
+  const { dir, probe, stat } = cacheFixture();
+  fs.writeFileSync(path.join(dir, "blocked"), "x", "utf8");
+  const env = { KODEVRA_CACHE_DIR: path.join(dir, "blocked", "cache") };
+
+  const result = bundledCatalog(probe, { env, readCatalog: () => BUNDLED, stat });
+  assert.equal(result.source, "codex");
+  assert.deepEqual(result.catalog, BUNDLED);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("no probe, no catalog: a missing Codex is not cached", () => {
+  const { dir } = cacheFixture();
+  const env = { KODEVRA_CACHE_DIR: dir };
+  assert.deepEqual(bundledCatalog({ ok: false }, { env }), { catalog: null, source: "none", file: null });
+  assert.deepEqual(fs.readdirSync(dir), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the default cache directory stays under the user's Kodevra directory", () => {
+  const previous = process.env.KODEVRA_CACHE_DIR;
+  delete process.env.KODEVRA_CACHE_DIR;
+  try {
+    assert.ok(catalogCacheDir().endsWith(path.join(".kodevra", "cache")));
+    assert.ok(catalogCacheDir({ KODEVRA_CACHE_DIR: "/tmp/somewhere" }).endsWith("somewhere"));
+  } finally {
+    if (previous !== undefined) process.env.KODEVRA_CACHE_DIR = previous;
   }
 });

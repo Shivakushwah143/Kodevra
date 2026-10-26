@@ -270,3 +270,174 @@ on.
   7.8 s, changes 8.0 s, total 8.0 s.
 - That stand-in run is a harness test, not a performance measurement: it does no
   reasoning and its timings say nothing about model latency.
+
+## 11. Diagnostics follow the invocation; wrapper overhead (second pass)
+
+### A. Why `doctor --engine codex -m openai/gpt-5.6-terra` probed freedeepseek
+
+Two different resolutions were in play. The adapter resolves the target the run
+will actually use (`resolveCodexRun`: explicit `-m` wins, otherwise Codex's
+`config.toml` decides) and builds `codex exec` from it. Diagnostics resolved the
+provider separately, straight from `~/.codex/config.toml`, and probed the
+`baseURL` of *that* provider. With `provider = "freedeepseek"` in the global
+config, every Codex diagnostic - including an explicit OpenAI run - asked
+`http://127.0.0.1:9655/v1/models` for a model it was not about to use, and failed
+when the proxy was down.
+
+Fix: one source of truth. `runDiagnostics` now receives the same `codexTarget`
+the exec arguments are built from, reports `model/provider` from it, and probes a
+proxy only when that effective provider has a known local `baseURL`. OpenAI has
+none, so no probe; `-m freedeepseek/deepseek-v4-flash` still probes. The auth
+check is keyed the same way: a custom-provider `codexAuth` success no longer
+passes an explicit OpenAI run that has no ChatGPT credential.
+
+### B. Why Docker was "unavailable" for a native Codex run
+
+The Codex branch treated Docker as *the* sandbox. It ran `docker info` on every
+Codex diagnostic and marked the result fatal, even though Docker is only the
+`--executor docker` verification container. Codex's own Windows sandbox
+(`[windows] sandbox = "elevated"`) is the boundary for host execution and does
+not need Docker at all.
+
+Fix: diagnostics take the executor this invocation will really use (`--executor`,
+`KODEVRA_EXECUTOR`, or the implicit Docker choice `--verify` makes) and probe
+Docker only for `docker`. On `host` the Docker line is not printed at all, and
+the `codex sandbox` line stays advisory (`fatal: false`) because it describes
+Codex's config, not a Kodevra precondition. OpenCode diagnostics are unchanged:
+Docker stays optional there and the proxy check still runs.
+
+### C. What changed
+
+- `lib/doctor.js` - `purpose: "run" | "doctor"`, `codexTarget`, `codexStatus`,
+  `executor` and an `engine` test seam; effective-provider proxy/auth routing;
+  Docker only for the selected executor. `purpose: "run"` keeps engine, auth,
+  model/provider, proxy and Docker-if-docker, and drops the informational
+  node/config/workspace/catalog lines.
+- `bin/kodevra.js` - pass the already-resolved `harnessInfo`/`codexTarget` into
+  diagnostics instead of letting it re-run `codex --version` and
+  `codex login status`; thread the real executor; mark `diagnostics` in the
+  phase timings.
+- `lib/codex.js` - bundled catalog cached by binary identity (path, size,
+  mtime) under `~/.kodevra/cache/`, skipped entirely when speed is not fast;
+  `resolveCodexRun` exported as the single resolution entry point.
+- `lib/engine.js` - quote the command when `KODEVRA_CODEX_BIN` is a `.cmd` path
+  containing spaces (it was previously split by the shell).
+- `lib/doctor.js` - allow a custom `engine` object (test seam) so the unchanged
+  OpenCode branch can be asserted without an OpenCode install.
+- `benchmarks/codex/wrapper-overhead.mjs` - self-contained harness: it writes a
+  stub `codex` that answers `--version`, `login status` and `debug models` and
+  emits minimal valid exec JSONL, then measures 11 runs in each mode.
+
+Not changed: `~/.codex/config.toml`, `auth.json`, the custom DeepSeek catalog,
+the verification gate, `--speed fast` planning, OpenCode's own diagnostics.
+
+### D/E. Wrapper overhead, before and after
+
+Same machine, same stub, same fixture; `total` is Kodevra's own end-of-run
+timings line, `wall` is the parent process. The "before" numbers were taken with
+a loopback stub of the FreeDeepseekAPI proxy, because the old diagnostics aborted
+the run otherwise.
+
+| | before median | before p95 | after median | after p95 |
+| --- | --- | --- | --- | --- |
+| default total | 1800 ms | 2300 ms | 700 ms | 900 ms |
+| default wall | 1913 ms | 2577 ms | 856 ms | 1166 ms |
+| fast total | 2000 ms | 2800 ms | 900 ms | 1400 ms |
+| fast wall | 2176 ms | 3010 ms | 1085 ms | 1581 ms |
+
+A second run of the same after code gave 1023/1440 ms and 1015/1385 ms
+(default/fast wall median/p95), so treat ~0.85-1.1 s as the range.
+
+Phase medians (warm, default / fast):
+
+| phase | before | after |
+| --- | --- | --- |
+| engine probe | 400 / 400 ms | 300 / 300 ms |
+| provider assessment | 500 / 500 ms | 300 / 300 ms |
+| speed plan + catalog | - / 800 ms | - / 500 ms |
+| workspace scan | 1300 / 1500 ms | 400 / 600 ms |
+| spawn preparation | 1400 / 1500 ms | 400 / 600 ms |
+| agent (stub) | 1500 / 1700 ms | 600 / 800 ms |
+| changes + outcome | 1800 / 2000 ms | 700 / 900 ms |
+
+Most of the win is the dropped duplicate Codex probe/auth/config work and the
+workspace scan no longer running twice; the catalog cache removes ~250 ms from
+`--speed fast`, which now skips the bundled-catalog lookup entirely unless a tier
+is being applied.
+
+Caveat: the stub is ~70 ms of Node start, not the real CLI. The real
+`codex --version` / `codex login status` / `codex debug models --bundled` cost was
+measured earlier at 0.4-1.1 s of the old 3-5 s wrapper, so a real-binary wrapper
+after this change should land near 1.2-1.7 s, still under the 3 s target.
+
+### F. Cold / warm / p95 (after, 11 runs each)
+
+| mode | cold total | warm median | warm p95 |
+| --- | --- | --- | --- |
+| default | 3500 ms | 700 ms | 900 ms |
+| fast | 1100 ms | 900 ms | 1400 ms |
+
+The default "cold" run is the first invocation after a fresh `git init` in the
+fixture (index and status are cold); the fast cold run also writes the bundled
+catalog cache once. Warm ≤ 3 s: met. Stretch ≤ 1.5 s: met on medians, and on
+default p95; fast p95 (1.58 s) sits just over because the catalog file is read
+fresh on some runs.
+
+### G. Tests
+
+`npm test` - **155 tests, 155 pass, 0 fail**. New coverage:
+`test/codex-diagnostics.test.js` asserts explicit OpenAI never calls the proxy
+probe, explicit DeepSeek does, the configured default is still probed without an
+override, native Codex never probes Docker while `--executor docker` does and a
+failing Docker probe blocks only that run, a custom-provider credential does not
+pass an explicit OpenAI run, run mode keeps only launch-critical checks, and the
+OpenCode branch still emits its optional Docker line plus its proxy check.
+Existing Codex and `--speed fast` tests are unchanged and pass.
+
+Live check with a real Codex CLI (`KODEVRA_CODEX_BIN` pointed at
+`codex-cli 0.164.0-alpha.11.1`; the npm shim on this machine is broken and the
+0.149.1 binary was not on PATH in this shell):
+
+```
+$ kodevra doctor --engine codex -m openai/gpt-5.6-terra
+  PASS  node            v24.13.1
+  PASS  engine          codex 0.164.0-alpha.11.1 . KODEVRA_CODEX_BIN
+  PASS  auth            ChatGPT sign-in
+  PASS  model/provider  OpenAI / gpt-5.6-terra
+  PASS  codex config    ~/.codex/config.toml . freedeepseek/deepseek-v4-flash
+  PASS  codex sandbox   [windows] sandbox = elevated
+  PASS  workspace       ...
+All checks passed.
+
+$ kodevra doctor --engine codex -m freedeepseek/deepseek-v4-flash
+  FAIL  proxy           http://127.0.0.1:9655/v1/models unreachable (fetch failed)
+  (everything else PASS)
+
+$ kodevra doctor --engine codex -m openai/gpt-5.6-terra --executor docker
+  FAIL  docker          Docker engine is not reachable (...)
+```
+
+No `docker` line appears for the host executor, and the proxy line appears only
+for the provider that has a local endpoint. `kodevra run --engine codex` on the
+same target prints four preflight checks (engine, auth, model/provider, codex
+sandbox), no proxy and no Docker, with `diagnostics` costing 0 ms because the
+probe was already paid for: `engine probe 0.5s . diagnostics 0.5s . workspace
+scan 0.7s . spawn 0.7s . total 1.1s` on the stub.
+
+### H. Projected Kodevra + Terra Fast runtime, from measured numbers only
+
+Wrapper: 0.7-0.9 s (stub), 1.2-1.7 s with the real binary's probes. Per model
+turn, measured on this machine: 12.34 s (123.4 s / 10 turns) and 13.45 s
+(295.9 s / 22 turns). So
+
+`runtime ≈ 0.9-1.7 s + turns × 12.3-13.4 s`
+
+- 5 turns: ~63-69 s
+- 6 turns: ~75-82 s
+- 7 turns: ~87-96 s
+
+The target therefore still needs ≤ 6 turns, or ≤ 7 on the fast per-turn figure.
+The wrapper change buys ~1.0 s, which is invisible next to turn count. **No ≤ 90 s
+claim is made**: the ChatGPT quota is still exhausted (`RATE_LIMITED` until
+25 Nov 2026), so no live `kodevra run --engine codex --speed fast` on
+`gpt-5.6-terra` was possible.

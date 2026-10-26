@@ -259,3 +259,26 @@ test("an untimed parse stays exactly as it was, with no at_ms keys", () => {
   assert.equal(events.firstEventAt, null);
   assert.equal(events.turnCompletedAt, null);
 });
+
+test("the catalog settings that make two CLI calls unnecessary are reported", () => {
+  const dir = tempDir();
+  const custom = path.join(dir, "custom.toml");
+  fs.writeFileSync(
+    custom,
+    [
+      'model = "gpt-5.6-terra"',
+      'model_catalog_json = "C:/Users/dev/.codex/freedeepseek-models.json"',
+      "profile = \"fast\"",
+    ].join("\n"),
+    "utf8",
+  );
+  const config = readCodexConfig(custom);
+  assert.equal(config.modelCatalogJson, "C:/Users/dev/.codex/freedeepseek-models.json");
+  assert.equal(config.profile, "fast");
+
+  const plain = path.join(dir, "plain.toml");
+  fs.writeFileSync(plain, 'model = "gpt-5.6-terra"\n', "utf8");
+  const bare = readCodexConfig(plain);
+  assert.equal(bare.modelCatalogJson, null, "no custom catalog means the bundled one is effective");
+  assert.equal(bare.profile, null);
+});
