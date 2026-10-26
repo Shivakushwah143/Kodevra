@@ -153,7 +153,9 @@ function run(command, args, { cwd, timeout, shell = false }) {
       cwd,
       timeout,
       shell,
-      env: { ...process.env, KODEVRA_SKIP_DOCKER_PROBE: "1", CI: "1", NO_COLOR: "1" },
+      // The engine resolves its project root from PWD, so the benchmark harness
+      // must point it at the task workspace, not at whatever shell started it.
+      env: { ...process.env, PWD: cwd, KODEVRA_SKIP_DOCKER_PROBE: "1", CI: "1", NO_COLOR: "1" },
     });
 
     const finish = (status, signal) => {
@@ -211,7 +213,12 @@ async function resetProviderSession(model) {
   const provider = `${model}`.split("/")[0];
   const entry = providerEntry(readConfig().data, provider);
   const baseURL = entry?.options?.baseURL;
-  if (!baseURL || !/localhost|127\.0\.0\.1|\[::1\]/.test(baseURL)) return { ok: false, reason: "no local proxy" };
+  // A hosted provider has no sticky client-side chat to reset: each request is
+  // independent, so there is nothing to do and nothing to fail. Kodevra's own
+  // provider catalog decides, not a hard-coded provider name.
+  if (!baseURL || !/localhost|127\.0\.0\.1|\[::1\]/.test(baseURL)) {
+    return { ok: true, applicable: false, reason: "not a local proxy; no session to reset" };
+  }
   try {
     const origin = baseURL.replace(/\/v1\/?$/, "").replace(/\/$/, "");
     const response = await fetch(`${origin}/reset-session?agent=all&history=drop`, {
@@ -359,7 +366,7 @@ async function executeTask(task, variant, options, attempt) {
     model: options.model,
     started_at: new Date().toISOString(),
     attempt,
-    session_reset: session.ok,
+    session_reset: session.applicable === false ? null : session.ok,
     session_reset_detail: session.reason,
     tokens: null,
     tool_failures: null,
