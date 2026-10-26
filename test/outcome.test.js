@@ -26,9 +26,10 @@ test("a verified run carries status, timing, verification and changed files", ()
     endedAt: 3_000,
     codex: {
       threadId: "01abc",
-      commands: [{ command: "npm test", exit_code: 0, status: "completed" }],
+      turns: 4,
+      commands: [{ command: "npm test", exit_code: 0, status: "completed", at_ms: 1_500 }],
       failedCommands: [],
-      fileChanges: [],
+      fileChanges: [{ changes: [{ path: "src/a.js" }], status: "completed", at_ms: 900 }],
       agentMessages: ["done"],
       tokens: { input: 1, cached_input: 0, output: 1, reasoning_output: 0 },
       turnCompleted: true,
@@ -49,6 +50,11 @@ test("a verified run carries status, timing, verification and changed files", ()
   assert.equal(outcome.evidence.agent.thread_id, "01abc");
   assert.equal(outcome.evidence.agent.commands.length, 1);
   assert.equal(outcome.evidence.agent.turn_completed, true);
+  // The turn budget is read from the record, so the count and the marks must survive.
+  assert.equal(outcome.evidence.agent.turns, 4);
+  assert.equal(outcome.evidence.agent.first_command_at_ms, 1_500);
+  assert.equal(outcome.evidence.agent.first_change_at_ms, 900);
+  assert.equal(outcome.evidence.agent.commands[0].at_ms, 1_500);
 });
 
 test("a failed verification is never upgraded to a pass", () => {

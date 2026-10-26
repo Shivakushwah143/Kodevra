@@ -252,6 +252,24 @@ test("timed lines carry at_ms evidence for the first command, edit and event", (
   assert.equal(events.turnCompleted, true);
 });
 
+test("the parse counts model turns from Codex's own turn events", () => {
+  const events = parseCodexEvents(
+    [
+      '{"type":"thread.started","thread_id":"01abc"}',
+      '{"type":"turn.started"}',
+      '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}',
+      '{"type":"turn.started"}',
+      '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":4}}',
+      '{"type":"turn.started"}',
+      '{"type":"turn.failed","error":{"message":"boom"}}',
+    ].join("\n"),
+  );
+
+  assert.equal(events.turns, 3, "two completed turns and one failed turn are all round trips");
+  assert.equal(events.turnFailed, true);
+  assert.equal(events.usage.output_tokens, 4, "usage is still the last completed turn");
+});
+
 test("an untimed parse stays exactly as it was, with no at_ms keys", () => {
   const events = parseCodexEvents('{"type":"item.completed","item":{"type":"command_execution","command":"npm test","exit_code":0,"status":"completed"}}');
 

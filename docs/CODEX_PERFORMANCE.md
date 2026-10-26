@@ -476,3 +476,63 @@ The wrapper change buys ~1.0 s, which is invisible next to turn count. **No ≤ 
 claim is made**: the ChatGPT quota is still exhausted (`RATE_LIMITED` until
 25 Nov 2026), so no live `kodevra run --engine codex --speed fast` on
 `gpt-5.6-terra` was possible.
+
+## 12. Turn budget: what the packet now carries (measured build cost only)
+
+Section 1 established that the 90 s target is a turn budget: <= 7 model turns at
+~12-13 s. The 306 s run used 22, and 8 of its 20 commands existed only because
+the environment surprised the model (5 failed `apply_patch` attempts through
+PowerShell, plus the cwd, npm and git denials). The facts block already described
+the symptoms; this pass makes it describe the working recipes, and adds the reads
+the model would otherwise spend turns on.
+
+### What changed
+
+1. **Concrete Windows recipes** (`lib/packet.js` `shellFacts`). Instead of "retry
+   with absolute paths" and "pass the patch as a single argument", the block now
+   says the shell starts in `C:\`, and names the exact forms that worked in the
+   trace: `Get-Content "<ws>\src\file.js"`, `npm.cmd --prefix "<ws>" test`,
+   `git -C "<ws>" status` / `git -c safe.directory="<ws>"`, and
+   `apply_patch "*** Begin Patch ... *** End Patch"` as ONE quoted argument, not
+   a here-string or piped stdin (both of which produced the run's
+   `requires a UTF-8 PATCH argument` / `last line ... *** End Patch` failures).
+2. **Bounded excerpts of the files the failure names** (`fileExcerpt`,
+   `importedFiles`). The pre-flight output names the failing test; the test
+   imports its subject; both are the files the model read at t=46.6 s and 57.6 s
+   in the trace. The packet now carries up to 2 excerpts (40 lines, 160 chars a
+   line, 64 KB per file), read-only and resolved inside the workspace. The bytes
+   are the file's own and are not rewritten, because the model could read the
+   same file with a tool; the bounds are the only limit.
+3. **Turn evidence in the outcome** (`lib/codex.js`, `lib/outcome.js`).
+   `parseCodexEvents` counts `turns` from Codex's `turn.completed` /
+   `turn.failed` events, and the outcome keeps `at_ms` on every command and file
+   change plus `first_command_at_ms` / `first_change_at_ms`. The next live run can
+   be read against a turn budget directly instead of inferring it from the wall
+   clock.
+
+The task text is still passed through byte-for-byte, the block is still one line,
+and Codex's system prompt, tools, sandbox, config and loop are untouched.
+
+### Measured
+
+- Packet build for the `01-bugfix-invoice-tax` fixture: **0.73 ms**, 2.9 KB,
+  with both excerpts (test + imported source). 50 builds averaged, same process.
+- Wrapper overhead unchanged by this pass: default warm wall **874 ms**
+  (p95 1383), fast **1032 ms** (p95 1350), 11 runs each; the packet is built
+  inside the run phase already counted there, and three workspace files cost
+  less than a millisecond.
+- `npm test`: **160 tests, 160 pass, 0 fail** (new: packet excerpts and their
+  bounds, traversal refusal, import resolution, turn counting, outcome marks).
+
+### What is *not* measured
+
+The ChatGPT account is still out of quota and `codex exec` returns
+`Reconnecting... waiting for network`, so **no live turn count exists for this
+change**. The plausible saving is arithmetic, not evidence: removing the five
+failed patch attempts (~65 s) and the two read turns the excerpts replace
+(~27 s) would take the 306 s run to roughly **215 s** - real, but still 12+
+turns and far from 90 s. Reaching <= 7 turns needs the model to plan, edit once
+and verify, which this packet makes possible but cannot prove. Run
+`node benchmarks/codex/runner.js --all` when quota returns; each record now
+carries `evidence.agent.turns` and the first-command / first-change marks, so the
+claim can be settled with one run instead of a trace reconstruction.

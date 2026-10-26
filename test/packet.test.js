@@ -1,7 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-import { PACKET_LIMITS, buildWorkspacePacket, clipOutput, referencedFiles, withWorkspacePacket } from "../lib/packet.js";
+import {
+  PACKET_LIMITS,
+  buildWorkspacePacket,
+  clipOutput,
+  fileExcerpt,
+  importedFiles,
+  referencedFiles,
+  withWorkspacePacket,
+} from "../lib/packet.js";
+
+function fixture(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-packet-"));
+  for (const [name, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), content);
+  }
+  return dir;
+}
 
 const FILES = ["package.json", "src/invoice.js", "src/money.js", "test/invoice.test.js"];
 const TASK = "invoiceTotal never applies TAX_RATE. Fix it in src/invoice.js and do not edit the tests.";
@@ -82,13 +102,65 @@ test("only paths that exist in the workspace are reported as mentioned", () => {
   assert.deepEqual(mentioned, ["src/invoice.js", "test/invoice.test.js"]);
 });
 
-test("the Windows shell notes appear only on win32", () => {
+test("the Windows shell notes appear only on win32 and name the working recipes", () => {
   const win = buildWorkspacePacket({ workspace: "C:\\work\\demo", files: FILES, platform: "win32" });
   const posix = buildWorkspacePacket({ workspace: "/work/demo", files: FILES, platform: "linux" });
 
   assert.match(win, /npm\.cmd works/);
   assert.match(win, /git -c safe\.directory="C:\\work\\demo" works/);
+  assert.match(win, /apply_patch must receive the whole patch as ONE quoted argument/);
+  assert.match(win, /apply_patch "\*\*\* Begin Patch/);
   assert.doesNotMatch(posix, /npm\.cmd/);
+});
+
+test("the files the failing output named are excerpted into the packet", () => {
+  const dir = fixture({
+    "src/invoice.js": "export function invoiceTotal(items) {\n  return items.reduce((sum, item) => sum + lineTotal(item), 0);\n}\n",
+    "test/invoice.test.js":
+      "import { invoiceTotal } from '../src/invoice.js';\ntest('includes tax', () => {\n  expect(invoiceTotal([{ price: 19.99, qty: 1 }])).toBe(21.64);\n});\n",
+  });
+
+  const packet = buildWorkspacePacket({
+    workspace: dir,
+    files: ["src/invoice.js", "test/invoice.test.js"],
+    verify: "npm test",
+    verification: {
+      ok: false,
+      status: 1,
+      output: "AssertionError at test/invoice.test.js:2: 19.99 !== 21.64",
+    },
+    platform: "linux",
+  });
+
+  assert.match(packet, /excerpt test\/invoice\.test\.js \(complete\): /);
+  assert.match(packet, /expect\(invoiceTotal/);
+  // The test imports its subject, so the file the edit lands in comes with it.
+  assert.match(packet, /excerpt src\/invoice\.js \(complete\): /);
+  assert.match(packet, /return items\.reduce/);
+  assert.equal(packet.includes("\n"), false);
+  assert.ok(packet.indexOf("excerpt") < packet.indexOf("</kodevra_context>"), "excerpts stay inside the block");
+});
+
+test("an excerpt is bounded and says how much it did not show", () => {
+  const dir = fixture({
+    "src/big.js": Array.from({ length: 100 }, (_, index) => `export const v${index} = ${index};`).join("\n"),
+  });
+  const excerpt = fileExcerpt(dir, "src/big.js", { ...PACKET_LIMITS, excerptLines: 5, excerptLine: 40 });
+
+  assert.match(excerpt, /^src\/big\.js \(first 5 of 100 lines\): /);
+  assert.match(excerpt, /\|\| \.\.\. 95 more lines$/);
+  assert.equal(excerpt.split(" || ").length, 6, "five lines plus the omission note");
+});
+
+test("an excerpt never reads outside the workspace or a non-text file", () => {
+  const dir = fixture({ "src/ok.js": "export const ok = true;\n", "src/blob.bin": "not selected" });
+
+  assert.equal(fileExcerpt(dir, "../secrets.js"), null);
+  assert.deepEqual(importedFiles(dir, "../secrets.js", ["src/ok.js"]), [], "no read outside the workspace");
+  assert.deepEqual(importedFiles(dir, "src/ok.js", ["src/ok.js"]), [], "a file with no relative imports adds nothing");
+  assert.equal(fileExcerpt(dir, "src/blob.bin"), null);
+  assert.equal(fileExcerpt(dir, "src/missing.js"), null);
+  assert.match(fileExcerpt(dir, "src/ok.js"), /ok = true/);
 });
 
 test("the file list is capped and says how many more there are", () => {
