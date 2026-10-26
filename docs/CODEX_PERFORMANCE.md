@@ -536,3 +536,88 @@ and verify, which this packet makes possible but cannot prove. Run
 `node benchmarks/codex/runner.js --all` when quota returns; each record now
 carries `evidence.agent.turns` and the first-command / first-change marks, so the
 claim can be settled with one run instead of a trace reconstruction.
+
+## 13. Turn forensics: the number that decides a prompt change
+
+The metric for turn compression is **model round trips to a verified change**, not
+tool calls. `benchmarks/codex/turn-report.mjs` derives it from Codex's own
+rollout JSONL (`$CODEX_HOME/sessions/<date>/rollout-*.jsonl`), the only place the
+response boundary is recorded:
+
+```bash
+node benchmarks/codex/turn-report.mjs --dir ~/.codex/sessions/2026/10/26 --group
+node benchmarks/codex/turn-report.mjs <rollout.jsonl>... --json
+```
+
+A turn is one model response. Two `exec_command` calls in one response are one
+turn; the same two calls in two responses are two. `calls/turn` therefore reads
+`1.00` for a model that never batches, and drops below 1 only when a change
+actually made it batch.
+
+### Baseline, six real runs on this machine (2026-10-26, `gpt-5.6-terra`, effort low)
+
+| run | label | turns | wall | calls/turn | env fails | first *successful* edit | planning-only turns |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 01 | native | 16 | 162.0 s | 1.00 | 7 | turn 8 (81.8 s) | 3 |
+| 02 | native | 24 | 288.8 s | 1.00 | 9 | turn 8 (91.5 s) | 4 |
+| 03 | native | 17 | 208.9 s | 1.00 | 3 | turn 7 (99.9 s) | 3 |
+| 04 | native | 11 | 118.2 s | 1.00 | 0 | none (no edit) | 2 |
+| 05 | context block | 18 | 263.7 s | 1.00 | 7 | turn 11 (163.7 s) | 3 |
+| 06 | native | 20 | 301.4 s | 1.00 | 3 | turn 7 (135.0 s) | 3 |
+
+Median 17 turns, p95 24; per-turn model latency median **8.99 s**, p90 **16.1 s**.
+Six runs, and not one batched two independent calls into a single response.
+
+### Where the turns go
+
+Classified from the tool calls themselves, per run (`!` = the call failed):
+
+```
+native  DEPENDENCY_LOOKUP! -> DISCOVERY! -> DISCOVERY -> DEPENDENCY_LOOKUP -> READ -> PLANNING
+        -> EDIT! x2 -> READ -> EDIT! x3 -> EDIT -> EDIT! x2 -> EDIT -> PLANNING
+        -> VERIFICATION! -> VERIFICATION -> PLANNING -> READ! -> OTHER -> PLANNING
+context DEPENDENCY_LOOKUP! -> DEPENDENCY_LOOKUP! -> OTHER! -> DISCOVERY -> DEPENDENCY_LOOKUP
+        -> PLANNING -> EDIT! x4 -> EDIT -> EDIT -> OTHER -> OTHER -> PLANNING
+        -> VERIFICATION -> VERIFICATION -> PLANNING
+```
+
+Environment failures by signature, over the six runs: `apply_patch` quoting in 4,
+cwd/ACL denial in 3, `npm.ps1` execution policy in 2, git "not a repository" in 2,
+relative-path-from-`C:\` in 1.
+
+### What this says about the interventions
+
+1. **The facts block did not change the shape of a run.** The one run that carried
+   the shell notes (`context`) still spent turns 1-3 on cwd discovery and turns
+   7-10 on `apply_patch` quoting, and reached its first successful edit at turn 11
+   (163.7 s) - later than every native run, three of which edited by turn 7-8.
+   Notes placed in the prompt are not read before the model acts.
+2. **Batching is not the lever yet.** Calls/turn is 1.00 in every trace, so a
+   prompt asking for batched reads addresses something the model was never doing
+   wrong; the turns are spent on *failures*, not on one-at-a-time reads.
+3. **Planning is free to cut**: 2-4 `update_plan` turns per run carry no
+   information and precede no change in direction.
+4. The committed packet change (section 12) removes two *read* turns by
+   construction, which is deterministic and is 2 of ~18. The patch loop (2-6
+   turns in the runs that hit it) and the cwd loop (2-3) are untouched by it.
+
+### A/B recipe when quota returns
+
+```bash
+# baseline: same binary, same model, same effort, no packet
+kodevra run --engine codex -m openai/gpt-5.6-terra --no-context --executor host \
+  --verify "npm.cmd test" --outcome base.json "<task>"
+# candidate: the committed packet
+kodevra run --engine codex -m openai/gpt-5.6-terra --executor host \
+  --verify "npm.cmd test" --outcome cand.json "<task>"
+
+node benchmarks/codex/turn-report.mjs ~/.codex/sessions/<date>/rollout-*.jsonl --group
+```
+
+`outcome.evidence.agent.turns` reports the same count per run, so the acceptance
+rule (verified pass >= baseline **and** median turns down **and** median verified
+runtime down) can be read from the outcome files directly.
+
+**No turn reduction is claimed.** The ChatGPT account refuses every request
+(`Reconnecting... waiting for network`), so no run of the packet change exists on
+this machine; every number above is from runs made before it.
