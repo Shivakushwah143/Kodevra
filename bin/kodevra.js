@@ -74,6 +74,18 @@ import {
   readProxyCatalog,
 } from "../lib/deepseek-web.js";
 import {
+  CHATGPT_WEB_MODEL,
+  CHATGPT_WEB_PROVIDER,
+  LIMITS,
+  bridgeSettings,
+  chatGptWebAssessment,
+  chatTurn,
+  probeBridge,
+  readWebSession,
+  writeWebSession,
+} from "../lib/chatgpt-web.js";
+import { runChatGptWebAgent } from "../lib/chatgpt-web-agent.js";
+import {
   PRESET_KEYS,
   activeSelection,
   assessProvider,
@@ -110,6 +122,8 @@ const USAGE = `${color.bold("Usage")}
   kodevra engines             list execution engines and their readiness
   kodevra engines use <name>  select opencode (default) or codex for future runs
   kodevra engines current     show the active execution engine
+  kodevra run -p chatgpt-web "<task>"  EXPERIMENTAL: the ordinary ChatGPT web tab through a local
+                              chatgpt-bridge (no API key, no engine tool calls)
   kodevra auth login chatgpt  sign in with a ChatGPT Plus/Pro account (OpenCode's official OAuth)
   kodevra auth login deepseek-web  run the FreeDeepseekAPI adapter's own browser sign-in
   kodevra auth login <p>      sign in to any provider through OpenCode's official flow
@@ -575,6 +589,8 @@ async function executeRun({
   speedConfig = [],
   stopSpeed = () => {},
   timings = createTimings(PROCESS_STARTED_AT),
+  chatGptWeb = false,
+  bridge = null,
 }) {
   const startedAt = Date.now();
   const before = workspaceChanges(workspace).files;
@@ -600,7 +616,9 @@ async function executeRun({
 
   // Model-requested shell only exists inside the Docker sandbox, and only for
   // OpenCode: Codex brings its own sandbox and does not load OpenCode tools.
-  const sandboxExec = harness === "opencode" && executor.name === "docker";
+  // The experimental ChatGPT-web loop has no engine tools at all, so there is
+  // nothing for a sandbox_exec tool to attach to.
+  const sandboxExec = harness === "opencode" && executor.name === "docker" && !chatGptWeb;
   let sandboxTool = null;
   if (sandboxExec) {
     try {
@@ -636,14 +654,18 @@ async function executeRun({
   // native per-agent `tools` map removes it from the request instead of rejecting
   // the call after the model has already spent a turn on it. Codex loads no
   // OpenCode tools, so there is nothing to hide for it.
-  const hiddenTools = harness === "opencode" ? unavailableTools({ agent: mode.agent }) : null;
+  const hiddenTools = harness === "opencode" && !chatGptWeb ? unavailableTools({ agent: mode.agent }) : null;
 
   //
   // Codex is different by design: its sandbox flag is the policy, and Codex
   // reads neither OPENCODE_CONFIG nor OpenCode tools. Kodevra therefore adds no
   // overlay for it and keeps the developer's environment untouched.
   let scope;
-  if (harness === "codex") {
+  if (chatGptWeb) {
+    // chatgpt-bridge is a browser transport, not an engine: no OpenCode overlay,
+    // no engine process, no environment rewriting.
+    scope = { env: { ...process.env }, warnings: [], cleanup() {} };
+  } else if (harness === "codex") {
     try {
       codexSandbox(mode.name);
     } catch (error) {
@@ -673,7 +695,7 @@ async function executeRun({
       KODEVRA_RUN_FILE: events.file ?? "",
     });
   }
-  if (harness === "opencode") {
+  if (harness === "opencode" && !chatGptWeb) {
     const planEnv = planRunEnv(selection, assessment, scope.env);
     scope.env = planEnv.env;
     if (planEnv.stripped) {
@@ -685,7 +707,9 @@ async function executeRun({
   if (scope.warnings?.length) {
     for (const warning of scope.warnings) console.log(`  ${color.yellow("scope  ")} ${warning}`);
   }
-  if (harness === "codex") {
+  if (chatGptWeb) {
+    console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; no shell in this run")}`);
+  } else if (harness === "codex") {
     if (codexTarget.note) console.log(`  ${color.yellow("model  ")} ${codexTarget.note}`);
     console.log(
       `  ${color.dim("scope  ")} ${workspace} ${color.dim(`- codex sandbox ${mode.name === "read-only" ? "read-only" : "workspace-write"}`)}`,
@@ -706,11 +730,19 @@ async function executeRun({
       );
     }
   }
-  console.log(
-    `${color.dim("kodevra")} ${color.dim("->")} ${harness} ${visibleArgs(
-      withProbePrefix(harness, harnessInfo, agentInvocation({ harness, opts, workspace, selection, mode, codexTarget })),
-    ).join(" ")}`,
-  );
+  if (chatGptWeb) {
+    console.log(
+      `${color.dim("kodevra")} ${color.dim("->")} chatgpt-bridge ${bridge.baseURL.replace(/^https?:\/\//, "")} ${color.dim(
+        "- textual action protocol, no native tool calls",
+      )}`,
+    );
+  } else {
+    console.log(
+      `${color.dim("kodevra")} ${color.dim("->")} ${harness} ${visibleArgs(
+        withProbePrefix(harness, harnessInfo, agentInvocation({ harness, opts, workspace, selection, mode, codexTarget })),
+      ).join(" ")}`,
+    );
+  }
   console.log(`${color.dim("mode   ")} ${mode.name} ${color.dim(`- ${mode.description}`)}`);
   if (opts.autoExplicit && opts.auto) {
     console.log(`  ${color.yellow("--auto ignored")} ${color.dim("unattended runs do not auto-approve tool permissions")}`);
@@ -849,6 +881,98 @@ async function executeRun({
     return result;
   };
 
+  // ---- experimental ChatGPT-web controller -------------------------------
+  // The bridge returns plain assistant text, so Kodevra owns the tool loop.
+  // Verification is still the developer's `--verify` command through the same
+  // executor and the same authorization gate.
+  const webSession = chatGptWeb
+    ? opts.continueSession || opts.session
+      ? readWebSession(workspace)
+      : null
+    : null;
+  let webState = null;
+
+  const runWebVerification = async (attempt) => {
+    let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
+    if (!gate.ok) {
+      approval = {
+        required: true,
+        changed: gate.drift.changed,
+        added: gate.drift.added,
+        removed: gate.drift.removed,
+        fingerprint: gate.drift.fingerprint,
+        fingerprintMismatch: Boolean(gate.fingerprintMismatch),
+      };
+      events.emit("approval_required", { command: opts.verify, ...approval });
+      printApproval(approval);
+      return {
+        command: opts.verify,
+        ok: false,
+        refused: true,
+        status: null,
+        output: "verification refused - approval required",
+        durationMs: 0,
+      };
+    }
+    if (gate.renewed) {
+      authorization = gate.authorization;
+      events.emit("verification_reapproved", {
+        command: opts.verify,
+        changed: gate.drift.changed,
+        added: gate.drift.added,
+        removed: gate.drift.removed,
+        fingerprint: authorization.fingerprint,
+      });
+    }
+    const result = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt });
+    timings.mark("verification");
+    return result;
+  };
+
+  const printWebEvent = (event) => {
+    if (event.type === "waiting") {
+      const turn = event.turn ? color.dim(` (turn ${event.turn}/${LIMITS.maxTurns})`) : "";
+      console.log(`  ${color.dim("chatgpt")} waiting for ChatGPT...${turn}`);
+    } else if (event.type === "action") {
+      const verb =
+        { read: "Reading", write: "Writing", edit: "Editing", list: "Listing", search: "Searching", verify: "Verifying", finish: "Finishing" }[
+          event.action
+        ] || event.action;
+      const subject =
+        event.action === "search" ? `"${event.query}"${event.path ? ` in ${event.path}` : ""}` : event.path ? `${event.path}...` : "...";
+      console.log(`  ${color.dim("chatgpt")} ${verb} ${subject}`);
+    } else if (event.type === "tool" && !event.ok) {
+      console.log(`  ${color.yellow("tool   ")} ${event.action} failed: ${trim(event.detail || "error", 120)}`);
+    } else if (event.type === "protocol_error") {
+      console.log(`  ${color.yellow("protocol")} ${event.reason}; sending one correction`);
+    } else if (event.type === "verify_result" && !event.ok) {
+      console.log(`  ${color.yellow("repair ")} verification failed (exit ${event.status ?? "?"}); the result went back to ChatGPT`);
+    } else if (event.type === "finish") {
+      console.log(`  ${color.dim("chatgpt")} finished: ${trim(event.summary || "(no summary)", 120)}`);
+    }
+  };
+
+  const webRun = async (attempt, taskText) => {
+    const result = await runChatGptWebAgent({
+      workspace,
+      task: taskText,
+      mode: mode.name,
+      chat: (message) => chatTurn({ ...message, settings: bridge }),
+      verify: opts.verify ? () => runWebVerification(attempt) : null,
+      continueSession: Boolean(opts.continueSession || opts.session) && attempt === 0,
+      sessionId: webSession,
+      onEvent: printWebEvent,
+    });
+    if (result.session) {
+      try {
+        writeWebSession(workspace, { session: result.session });
+      } catch {
+        // The conversation mapping is a convenience for -c; the run is the truth.
+      }
+    }
+    return result;
+  };
+
   // Sandbox commands run inside the engine's process, so Kodevra learns about
   // them by tailing the run's own event file. No extra orchestration.
   const stopProgress = watchRunEvents(events.file, {
@@ -869,11 +993,40 @@ async function executeRun({
   try {
     const firstPrompt = wantsContext ? withWorkspacePacket(packet, opts.message.join(" ")) : null;
     timings.mark("spawn");
-    events.emit("model_started", { attempt: 0, agent: harness === "codex" ? "codex exec" : mode.agent });
-    run = await runAgent(
-      agentInvocation({ harness, opts, workspace, selection, mode, codexTarget, prompt: firstPrompt, speedConfig }),
-      0,
-    );
+    events.emit("model_started", {
+      attempt: 0,
+      agent: chatGptWeb ? "chatgpt-bridge" : harness === "codex" ? "codex exec" : mode.agent,
+    });
+    if (chatGptWeb) {
+      webState = await webRun(0, opts.message.join(" "));
+      run = {
+        status: webState.ok ? 0 : 1,
+        signal: null,
+        output: webState.transcript,
+        durationMs: webState.endedAt - webState.startedAt,
+      };
+      const spawnAt = timings.at("spawn");
+      if (webState.firstEditMs !== null && spawnAt !== null) {
+        timings.markAt("first_edit", spawnAt + webState.firstEditMs);
+      }
+      if (!webState.ok) {
+        failure = webState.failure;
+        printFailure(failure);
+        events.emit("failure", { code: failure.code, origin: failure.origin, message: failure.message });
+        events.emit("verification_skipped", { reason: "the chatgpt-web loop stopped" });
+      }
+      console.log(
+        `  ${color.dim("chatgpt")} ${webState.turns} turn(s) · ${webState.actions.length} action(s) · ${(
+          (webState.endedAt - webState.startedAt) /
+          1000
+        ).toFixed(1)}s`,
+      );
+    } else {
+      run = await runAgent(
+        agentInvocation({ harness, opts, workspace, selection, mode, codexTarget, prompt: firstPrompt, speedConfig }),
+        0,
+      );
+    }
     timings.mark("agent");
     if (harness === "codex") markCodexPhases(timings, codexEvidence);
     if (run.timedOut) {
@@ -892,7 +1045,7 @@ async function executeRun({
       duration_ms: run.durationMs,
     });
 
-    if (run.status !== 0) {
+    if (run.status !== 0 && !failure) {
       failure = classifyFailure({
         output: harness === "codex" ? codexFailureText(run, codexEvidence) : run.output,
         status: run.status,
@@ -907,7 +1060,18 @@ async function executeRun({
     }
     changesAfterRun = emitFileChanges(events, workspace);
 
-    if (opts.verify && !failure) {
+    if (opts.verify && !failure && chatGptWeb) {
+      // The controller already ran the developer's command when ChatGPT asked
+      // for it. Reuse that authoritative result only while the workspace has not
+      // been edited since; otherwise run the gate once, now.
+      const last = webState?.lastVerification ?? null;
+      if (last && !last.refused) {
+        verification = last;
+      } else if (!last) {
+        const result = await runWebVerification(0);
+        if (!result.refused) verification = result;
+      }
+    } else if (opts.verify && !failure) {
       let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
       if (!gate.ok) {
         approval = {
@@ -1824,6 +1988,26 @@ async function main() {
     config: config.data,
     engine,
   });
+  // EXPERIMENTAL: the ordinary ChatGPT web tab. It is a browser transport, not
+  // an engine catalog entry, so it bypasses provider assessment and model
+  // profiles entirely.
+  const chatGptWeb = selection.provider === CHATGPT_WEB_PROVIDER;
+  if (chatGptWeb) {
+    if (harness === "codex") {
+      console.error(`${color.red("--provider chatgpt-web does not run through Codex.")} ${color.dim("Drop --engine codex.")}`);
+      process.exit(2);
+    }
+    selection.model = CHATGPT_WEB_MODEL;
+    if (opts.command !== "run" && opts.command !== "doctor") {
+      console.error(
+        `${color.red("--provider chatgpt-web is only available for kodevra run.")} ${color.dim(
+          "It drives a browser tab; there is no interactive engine session behind it.",
+        )}`,
+      );
+      process.exit(2);
+    }
+  }
+  const webBridge = chatGptWeb ? bridgeSettings() : null;
   timings.mark("selection");
   // Provider assessment exists for OpenCode's credential and model plumbing. A
   // Codex run only needs it for the unsupported-provider guard and the plan, yet
@@ -1832,10 +2016,12 @@ async function main() {
   // child process (`opencode models openai`, 4-5 s here) - neither of which is a
   // fact about a Codex run. Ask for neither. `kodevra providers`, `kodevra auth
   // status` and `kodevra doctor` still do the full assessment.
-  const assessment = assessProvider(
-    selection.provider,
-    harness === "codex" ? { config: config.data, catalog: null, liveModels: null } : { config: config.data, engine },
-  );
+  const assessment = chatGptWeb
+    ? chatGptWebAssessment()
+    : assessProvider(
+        selection.provider,
+        harness === "codex" ? { config: config.data, catalog: null, liveModels: null } : { config: config.data, engine },
+      );
   timings.mark("assessment");
   phaseMark("provider_assessed");
   // Codex has its own provider config and credential store; Kodevra reports the
@@ -1937,7 +2123,7 @@ async function main() {
   let effort = { effort: null, warning: null };
   let modelConfig = null;
   let outputPlan = { output: null, note: null, source: "model catalog" };
-  if (harness === "opencode") {
+  if (harness === "opencode" && !chatGptWeb) {
     profile = modelProfile(engineProviderId(selection.provider), selection.model);
     try {
       effort = resolveEffort(profile, opts.reasoning ?? process.env.KODEVRA_REASONING ?? null);
@@ -2005,12 +2191,20 @@ async function main() {
       auth: authLine,
       sandbox: sandboxStatusLine(executorNameForDisplay(opts)),
       mode: activeMode,
-      engine: harness,
+      engine: chatGptWeb ? "chatgpt-bridge" : harness,
       hints: opts.command === "launch" || opts.command === "run",
     }),
   );
 
-  if (harness === "opencode" && (opts.command === "run" || opts.command === "launch")) {
+  if (chatGptWeb) {
+    console.log(`  ${color.dim("Billing ")} ChatGPT web account ${color.dim("- the signed-in Chrome session, not API billing")}`);
+    console.log(`  ${color.dim("Bridge  ")} ${webBridge.baseURL} ${color.dim("- localhost only; Kodevra never reads ChatGPT cookies")}`);
+    console.log(
+      `  ${color.dim("Protocol")} one JSON action per turn ${color.dim("- ChatGPT has no native tool calls on this path")}`,
+    );
+  }
+
+  if (harness === "opencode" && !chatGptWeb && (opts.command === "run" || opts.command === "launch")) {
     const appliedOutput = modelConfig ? outputPlan.output : null;
     console.log(`  ${color.dim("model   ")} ${describeProfile(profile, { effort: effort.effort, output: appliedOutput })}`);
     if (effort.warning) console.log(`  ${color.yellow("model   ")} ${effort.warning}`);
@@ -2045,7 +2239,25 @@ async function main() {
   const diagnosticExecutor = opts.executor || process.env.KODEVRA_EXECUTOR || (opts.verify ? "docker" : "host");
   let failed = 0;
   let optionalMissing = 0;
-  if (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1")) {
+  // The experiment has exactly one readiness question: is the local bridge up
+  // with a logged-in browser tab attached? Engine/provider diagnostics say
+  // nothing about that, so asking them would only invent failures.
+  if (chatGptWeb) {
+    const probe = await probeBridge(webBridge);
+    console.log(`  ${mark(probe.ok)}  ${color.bold("ChatGPT bridge".padEnd(18))}  ${color.dim(probe.detail)}`);
+    if (!probe.ok) {
+      if (probe.hint) console.log(`  ${color.yellow("->")} ${probe.hint}`);
+      timings.mark("diagnostics");
+      if (diagnosticsAlways || opts.doctor) process.exit(1);
+    }
+    timings.mark("diagnostics");
+    phaseMark("diagnostics");
+    if (diagnosticsAlways) {
+      if (probe.ok) console.log(color.green("All checks passed."));
+      process.exit(probe.ok ? 0 : 1);
+    }
+  }
+  if (!chatGptWeb && (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1"))) {
     const result = await runDiagnostics({
       workspace,
       model,
@@ -2079,7 +2291,7 @@ async function main() {
     process.exit(1);
   }
 
-  if (!harnessInfo.available) {
+  if (!chatGptWeb && !harnessInfo.available) {
     console.error(color.red(harnessInfo.detail || `${harness} is not installed.`));
     if (harnessInfo.hint) console.error(`  ${color.yellow("->")} ${harnessInfo.hint}`);
     process.exit(1);
@@ -2101,6 +2313,8 @@ async function main() {
       speedConfig,
       stopSpeed,
       timings,
+      chatGptWeb,
+      bridge: webBridge,
     });
     return;
   }
