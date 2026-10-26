@@ -404,6 +404,12 @@ Codex has its own credentials and provider configuration (`~/.codex`); Kodevra n
 vice versa, and never reads a credential value. See `docs/CODEX_BENCHMARK.md` for the integration contract, the
 five benchmark scenarios, the real results and the current blockers.
 
+Before the first turn, `run --engine codex` also runs the `--verify` command once and hands Codex a one-line
+`<kodevra_context>` block of measured facts: workspace root, files, that failing output, the paths it mentions, and
+on Windows the three shell constraints that otherwise cost a fresh agent five turns to discover. The task text is
+passed through unchanged; `--no-context` runs the previous, context-free baseline. Codex runs also print and record
+a phase table (`outcome.timing.phases_ms`). `docs/CODEX_PERFORMANCE.md` has the per-command analysis behind it.
+
 ## Layout
 
 | Path | Purpose |
@@ -416,6 +422,8 @@ five benchmark scenarios, the real results and the current blockers.
 | `lib/engine.js` | streams the engine, captures its tail, runs the verification command |
 | `lib/harness.js` | execution-engine registry and selection (OpenCode default, Codex opt-in) |
 | `lib/codex.js` | Codex CLI adapter: discovery, auth presence, flag translation, JSONL evidence |
+| `lib/packet.js` | The `<kodevra_context>` facts block handed to Codex before its first turn |
+| `lib/timings.js` | Per-phase clock readings for one run (`--engine codex` prints them) |
 | `lib/outcome.js` | `kodevra.outcome/1` normalised result (`--outcome`, `run_outcome` event) |
 | `lib/executable.js` | shared PATH executable resolver |
 | `lib/verify.js` | workspace-scoped git + metadata evidence, failure signatures, repair prompt, completion summary |

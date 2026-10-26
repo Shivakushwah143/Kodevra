@@ -79,6 +79,11 @@ import {
   withoutApiKeyBilling,
   writeState,
 } from "../lib/providers.js";
+import { createTimings, timingsLine } from "../lib/timings.js";
+import { buildWorkspacePacket, withWorkspacePacket } from "../lib/packet.js";
+
+/** Anchor for phase timings: everything after this point is measured, not inferred. */
+const PROCESS_STARTED_AT = Date.now();
 
 const USAGE = `${color.bold("Usage")}
   kodevra [path]              start the agent in a workspace (default: current directory)
@@ -111,6 +116,9 @@ ${color.bold("Options")}
                               (default: workspace-write for run, ask for launch)
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
       --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
+      --context, --no-context give Codex the workspace facts Kodevra measured first
+                              (root, files, pre-flight failure output, shell notes;
+                              on by default for run --engine codex)
   -c, --continue              continue the last session
   -s, --session <id>          continue a specific session
       --executor <name>       where project commands run: host | docker (default: host)
@@ -219,6 +227,7 @@ function parse(argv) {
     executorExplicit: false,
     reapprove: null,
     eventsJson: false,
+    context: true,
     yes: false,
     agentTimeoutMs: null,
     agentIdleMs: null,
@@ -283,6 +292,8 @@ function parse(argv) {
     else if (arg === "--timeout") opts.agentTimeoutMs = Math.max(1, Number(argv[(index += 1)]) || 0) * 1000;
     else if (arg === "--idle-timeout") opts.agentIdleMs = Math.max(1, Number(argv[(index += 1)]) || 0) * 1000;
     else if (arg === "--events-json") opts.eventsJson = true;
+    else if (arg === "--context") opts.context = true;
+    else if (arg === "--no-context") opts.context = false;
     else if (arg === "-y" || arg === "--yes") opts.yes = true;
     else if (arg === "--no-doctor") opts.doctor = false;
     else if (arg === "--") {
@@ -451,6 +462,21 @@ async function runVerificationWithEvents({ executor, command, workspace, events,
   return result;
 }
 
+/**
+ * Phase marks taken from Codex's own streamed events. `spawn` is the anchor, so
+ * "first edit" really is spawn + the timestamp of Codex's file_change event,
+ * not an average or an estimate from the total duration.
+ */
+function markCodexPhases(timings, evidence) {
+  const spawnAt = timings.at("spawn");
+  if (spawnAt === null) return;
+  if (Number.isFinite(evidence.firstEventAt)) timings.markAt("first_event", spawnAt + evidence.firstEventAt);
+  const tool = (evidence.commands ?? []).find((command) => Number.isFinite(command.at_ms));
+  if (tool) timings.markAt("first_tool", spawnAt + tool.at_ms);
+  const edit = (evidence.fileChanges ?? []).find((change) => Number.isFinite(change.at_ms));
+  if (edit) timings.markAt("first_edit", spawnAt + edit.at_ms);
+}
+
 function emitFileChanges(events, workspace) {
   const changes = workspaceChanges(workspace);
   events.emit("file_changes", {
@@ -477,10 +503,22 @@ function planRunEnv(selection, assessment, env = process.env) {
  * command's exit code, not the model's prose, makes this PASS or FAIL. The
  * executor is the host today and says so; it is not sandboxed.
  */
-async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment }) {
+async function executeRun({
+  engine,
+  harness,
+  harnessInfo,
+  codexTarget,
+  opts,
+  workspace,
+  model,
+  selection,
+  assessment,
+  timings = createTimings(PROCESS_STARTED_AT),
+}) {
   const startedAt = Date.now();
   const before = workspaceChanges(workspace).files;
   const beforeTree = snapshotTree(workspace);
+  timings.mark("workspace_scan");
   const maxRepairs = Number.isFinite(opts.maxRepairs) ? Math.max(0, Math.min(5, opts.maxRepairs)) : 2;
   const mode = resolveMode(opts);
   const agentTimeoutMs = opts.agentTimeoutMs ?? Number(process.env.KODEVRA_RUN_TIMEOUT_MS || 1_800_000);
@@ -633,10 +671,49 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
       source: authorization.source,
     });
   }
-  console.log("");
+  console.log("");  // Pre-flight + workspace facts for Codex. One extra run of the verification
+  // command, *before* the agent starts, turns "the tests fail somewhere" into
+  // evidence the model can act on, instead of something it has to rediscover a
+  // turn at a time. It is skipped for a sandboxed executor (the container run is
+  // the expensive one) and can be turned off with --no-context.
+  const wantsContext = harness === "codex" && opts.context !== false && opts.message.length > 0;
+  let packet = null;
+  if (wantsContext) {
+    let preflight = null;
+    if (opts.verify && executor.name === "host") {
+      events.emit("preflight_started", { command: opts.verify });
+      const preflightStartedAt = Date.now();
+      try {
+        // Quiet: the output is captured for the packet, not sprayed into the
+        // terminal before the run has even started.
+        preflight = await executor.run(opts.verify, { cwd: workspace, forward: false });
+      } catch (error) {
+        preflight = { command: opts.verify, ok: false, status: 1, output: error.message, durationMs: 0 };
+      }
+      timings.mark("preflight");
+      const preflightMs = Date.now() - preflightStartedAt;
+      events.emit("preflight_finished", {
+        command: opts.verify,
+        ok: Boolean(preflight?.ok),
+        status: preflight?.status ?? null,
+        duration_ms: preflightMs,
+      });
+      console.log(
+        `  ${color.dim("preflight")} ${opts.verify} ${color.dim("->")} ${
+          preflight?.ok ? color.green("exit 0") : color.yellow(`exit ${preflight?.status ?? "?"}`)
+        } ${color.dim(`(${(preflightMs / 1000).toFixed(1)}s)`)}`,
+      );
+    }
+    const knownFiles = [...beforeTree.files.keys()].sort();
+    packet = buildWorkspacePacket({ workspace, verify: opts.verify, verification: preflight, files: knownFiles });
+    console.log(
+      `  ${color.dim("context ")} ${knownFiles.length} file(s)${preflight ? " + pre-flight output" : ""} ${color.dim("- facts only; the task text is unchanged")}`,
+    );
+  }
 
   let run = { status: 1, signal: null, output: "", durationMs: 0 };
   let failure = null;
+
   let verification = null;
   let repairs = 0;
   let approval = null;
@@ -661,19 +738,33 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
   });
 
   try {
+    const firstPrompt = wantsContext ? withWorkspacePacket(packet, opts.message.join(" ")) : null;
+    const codexLines = [];
+    timings.mark("spawn");
     events.emit("model_started", { attempt: 0, agent: harness === "codex" ? "codex exec" : mode.agent });
-    run = await streamEngine(harnessInfo.probe, withProbePrefix(harness, harnessInfo, agentInvocation({ harness, opts, workspace, selection, mode, codexTarget })), {
-      cwd: workspace,
-      env: scope.env,
-      timeoutMs: agentTimeoutMs,
-      idleMs: agentIdleMs,
-      // Codex's JSONL is evidence, not terminal output; it is rendered compactly
-      // below and kept in the run log.
-      forward: harness !== "codex",
-    });
+    run = await streamEngine(
+      harnessInfo.probe,
+      withProbePrefix(
+        harness,
+        harnessInfo,
+        agentInvocation({ harness, opts, workspace, selection, mode, codexTarget, prompt: firstPrompt }),
+      ),
+      {
+        cwd: workspace,
+        env: scope.env,
+        timeoutMs: agentTimeoutMs,
+        idleMs: agentIdleMs,
+        // Codex's JSONL is evidence, not terminal output; it is rendered compactly
+        // below and kept in the run log.
+        forward: harness !== "codex",
+        onLine: harness === "codex" ? (line, at) => codexLines.push({ line, at }) : null,
+      },
+    );
+    timings.mark("agent");
     if (harness === "codex") {
-      codexEvidence = parseCodexEvents(run.output);
+      codexEvidence = parseCodexEvents(codexLines.length ? codexLines : run.output);
       for (const line of renderCodexRun(codexEvidence)) console.log(line);
+      markCodexPhases(timings, codexEvidence);
     }
     if (run.timedOut) {
       events.emit("model_cancelled", {
@@ -731,6 +822,7 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
           });
         }
         verification = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt: 0 });
+        timings.mark("verification");
         let signature = failureSignature(verification.output);
 
         while (!verification.ok && repairs < maxRepairs) {
@@ -833,6 +925,7 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
   }
 
   const changes = workspaceChanges(workspace);
+  timings.mark("changes");
   // Git speaks for tracked files; a workspace inside an ignored directory gets
   // its evidence from the file-metadata snapshot instead of claiming zero.
   const treeFiles = treeChangedFiles(beforeTree, workspace);
@@ -855,6 +948,7 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
     changed_files: changes.files.length,
   });
 
+  timings.mark("outcome");
   const outcome = normalizeOutcome({
     harness,
     model,
@@ -872,7 +966,18 @@ async function executeRun({ engine, harness, harnessInfo, codexTarget, opts, wor
     startedAt,
     endedAt: Date.now(),
     codex: codexEvidence,
+    timings: timings.toJSON(),
   });
+  timings.mark("total");
+  outcome.timing.phases_ms = timings.toJSON();
+
+  // The phase table only describes the engine that produced it; OpenCode runs
+  // keep exactly the output they had before.
+  if (harness === "codex") {
+    const line = timingsLine(timings);
+    if (line) console.log(`\n  ${color.dim("timings ")} ${color.dim(line)}`);
+  }
+
   events.emit("run_outcome", outcome);
   if (opts.outcome) {
     const outcomeFile = writeOutcome(opts.outcome, outcome);
@@ -935,6 +1040,9 @@ function withProbePrefix(harness, harnessInfo, args) {
  * `codex exec` with its own sandbox flag and the task verbatim, so Kodevra adds
  * no orchestration around it. Repairs re-run Codex with the failure prompt
  * (Codex `exec resume` has no sandbox flag, so it is deliberately not used).
+ *
+ * `prompt` only exists so the first Codex call can carry the workspace facts
+ * block; the task text inside it is never rewritten.
  */
 function agentInvocation({
   harness,
@@ -944,6 +1052,7 @@ function agentInvocation({
   mode,
   codexTarget,
   message = opts.message,
+  prompt = null,
   repair = false,
 }) {
   if (harness === "codex") {
@@ -951,7 +1060,7 @@ function agentInvocation({
       mode: mode.name,
       workspace,
       target: codexTarget,
-      prompt: message.length ? message.join(" ") : null,
+      prompt: prompt ?? (message.length ? message.join(" ") : null),
       interactive: false,
     });
   }
@@ -1515,6 +1624,7 @@ function enginesCommand(opts, engine) {
 }
 
 async function main() {
+  const timings = createTimings(PROCESS_STARTED_AT);
   let opts;
   try {
     opts = parse(process.argv.slice(2));
@@ -1523,6 +1633,7 @@ async function main() {
     console.log(USAGE);
     process.exit(2);
   }
+  timings.mark("bootstrap");
 
   if (opts.command === "help" || opts.help) {
     console.log(banner({}));
@@ -1541,7 +1652,10 @@ async function main() {
     if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
     process.exit(2);
   }
+  // One cached probe: `codex --version` and `codex login status` are separate
+  // processes but a single readiness question, so they are timed as one phase.
   const harnessInfo = harnessStatus(harness, { engine });
+  timings.mark("engine_probe");
 
   if (opts.command === "version") {
     const selection = activeSelection({ config: config.data, engine });
@@ -1712,7 +1826,7 @@ async function main() {
   }
 
   if (opts.command === "run") {
-    await executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment });
+    await executeRun({ engine, harness, harnessInfo, codexTarget, opts, workspace, model, selection, assessment, timings });
     return;
   }
 

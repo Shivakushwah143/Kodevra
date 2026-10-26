@@ -60,6 +60,7 @@ Options
   --variant <v>         kodevra | codex-cli | both (default: both)
   --model <id>          provider/model used by both variants (default: ${DEFAULT_MODEL})
   --force               re-run tasks that already have a result
+  --no-context          kodevra variant without the workspace-facts block (A/B baseline)
   --retries <n>         retry an infrastructure failure (default: 1, max: 2)
   --timeout <ms>        per agent run (default: ${AGENT_TIMEOUT})
   --summary             regenerate results/summary.md
@@ -76,6 +77,7 @@ function parse(argv) {
     variant: "both",
     model: DEFAULT_MODEL,
     force: false,
+    context: true,
     check: false,
     list: false,
     summary: false,
@@ -95,6 +97,7 @@ function parse(argv) {
     else if (arg === "--check") opts.check = true;
     else if (arg === "--summary") opts.summary = true;
     else if (arg === "--force") opts.force = true;
+    else if (arg === "--no-context") opts.context = false;
     else if (arg === "--retries") opts.retries = Math.max(0, Math.min(2, Number(argv[(index += 1)]) || 0));
     else if (arg === "--task") opts.tasks.push(...String(argv[(index += 1)] || "").split(",").filter(Boolean));
     else if (arg === "--variant") opts.variant = argv[(index += 1)] || "both";
@@ -182,6 +185,7 @@ function buildAgent(variant, task, workspace, options, target, outcomeFile) {
         "--outcome",
         outcomeFile,
         "--no-doctor",
+        ...(options.context === false ? ["--no-context"] : []),
         task.prompt,
       ],
       shell: false,
@@ -267,6 +271,8 @@ async function executeTask(task, variant, options, attempt) {
     codex_provider: target.provider,
     codex_provider_mismatch: target.providerMismatch,
     codex_version: target.info.version,
+    // Recorded so an A/B pair can be told apart afterwards.
+    workspace_context: variant === "kodevra" ? options.context !== false : false,
     started_at: new Date().toISOString(),
     attempt,
     session_reset: sessionOk,
@@ -551,14 +557,14 @@ function summarize(tasks, options) {
 
   lines.push("## What each variant did");
   lines.push("");
-  lines.push("- `kodevra`: `kodevra run --engine codex --verify <task verify> --executor host` - the Codex adapter, Kodevra's verification gate, bounded repair (2) and a normalised outcome file (`--outcome`).");
+  lines.push("- `kodevra`: `kodevra run --engine codex --verify <task verify> --executor host` - the Codex adapter, a pre-flight run of the same verification command feeding a workspace-facts block into Codex's prompt, Kodevra's verification gate, bounded repair (2) and a normalised outcome file (`--outcome`). `--no-context` removes the facts block for an A/B baseline.");
   lines.push("- `codex-cli`: the official `codex exec --sandbox workspace-write --json` with the same prompt, model and starting repository, and no Kodevra involvement.");
   lines.push("- Both are judged afterwards by the same hidden acceptance test, copied in only after the agent stops.");
   lines.push("");
 
   lines.push("## Fairness notes");
   lines.push("");
-  lines.push("- Same model id, same task prompt (Kodevra does not prepend a workspace hint for Codex; `-C` anchors the run), same starting repository, same acceptance test.");
+  lines.push("- Same model id, same task text, same starting repository, same acceptance test. The task text is byte-identical in both variants; the kodevra variant adds a one-line `<kodevra_context>` block of measured facts (root, file list, the pre-flight result of the same verify command, shell notes), and `--no-context` runs the earlier, context-free baseline.");
   lines.push("- Every repository is reset from its fixture before a run, and its own git root is created under the system temp directory.");
   lines.push("- The fixture directory is hashed before and after; a run that touches a fixture is rejected as `fixture_tampered` instead of scored.");
   lines.push("- A Kodevra PASS requires both its own verification and the hidden acceptance test to pass. Plain Codex gets one attempt; Kodevra may run up to two repairs, so a Kodevra win can reflect the repair loop rather than the harness.");
@@ -570,7 +576,7 @@ function summarize(tasks, options) {
   lines.push("");
   lines.push("- A single machine, one date and one model: this is a reproducibility harness, not a claim of superiority.");
   lines.push("- Plain Codex gets no `--verify` loop, so the comparison measures the whole Kodevra path (gate + repair + outcome) against the raw CLI, not the two harnesses' reasoning in isolation.");
-  lines.push("- Kodevra's `--verify` runs the task suite inside the run and the runner runs it again with the hidden test; Kodevra's recorded duration therefore includes one extra suite run.");
+  lines.push("- Kodevra's `--verify` runs the task suite inside the run and the runner runs it again with the hidden test; Kodevra's recorded duration therefore includes one extra suite run, plus the pre-flight run when `--context` is on.");
   lines.push("");
 
   fs.mkdirSync(RESULTS_DIR, { recursive: true });

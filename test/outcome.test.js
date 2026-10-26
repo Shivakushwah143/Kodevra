@@ -118,3 +118,20 @@ test("the outcome is written as JSON at the requested path", () => {
   const file = writeOutcome(path.join(dir, "nested", "outcome.json"), normalizeOutcome({ harness: "codex", model: "m", run }));
   assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).harness, "codex");
 });
+
+test("phase timings are carried in the outcome when a run measured them", () => {
+  const outcome = normalizeOutcome({
+    harness: "codex",
+    model: "m",
+    run,
+    startedAt: 0,
+    endedAt: 1_000,
+    timings: { spawn: 1_200, first_edit: 61_500, total: 296_000 },
+  });
+
+  assert.deepEqual(outcome.timing.phases_ms, { spawn: 1_200, first_edit: 61_500, total: 296_000 });
+});
+
+test("a run without instrumentation reports null phases instead of zero", () => {
+  assert.equal(normalizeOutcome({ harness: "codex", model: "m", run }).timing.phases_ms, null);
+});

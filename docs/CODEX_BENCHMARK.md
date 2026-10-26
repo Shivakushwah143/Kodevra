@@ -239,6 +239,14 @@ The plain-CLI pass changed the same file and passed the same hidden test in
 127.8 s (tokens for that record are `null`: it was recorded before the runner
 parsed the plain CLI's JSONL usage).
 
+The 306 s / 128 s gap is analysed, with per-command evidence, in
+[`CODEX_PERFORMANCE.md`](CODEX_PERFORMANCE.md): plain Codex also needed 214.9 s
+on the same task without Kodevra, ~13 s per model turn, so the difference is 12
+extra turns spent fighting the Windows sandbox, not Kodevra overhead. Codex runs
+now receive a one-line workspace-facts block built from a pre-flight run of the
+same `--verify` command (`--no-context` restores the previous baseline), and
+`outcome.timing.phases_ms` records the phase table.
+
 **Do not read a harness ranking from this.** Two valid results out of ten
 attempts is a smoke-level comparison, and both used ChatGPT, not the project's
 default DeepSeek model. After the second full run the ChatGPT account hit its

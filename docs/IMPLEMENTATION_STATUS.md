@@ -534,8 +534,16 @@ Kodevra only launches it, applies its existing verification gate and bounded rep
 Observed on this machine (2026-10-26): Codex CLI 0.149.1, ChatGPT sign-in, `openai/gpt-5.6-terra`.
 `kodevra run --engine codex --verify "npm test"` fixed `benchmarks/codex/tasks/01-bugfix-invoice-tax` in 306.1 s,
 changed one file, and the hidden acceptance test passed (`verified`); the official CLI passed the same scenario in
-127.8 s. The remaining four scenarios were rate-limited by the ChatGPT account after that, so no pass rate is
-claimed. The local DeepSeek proxy was down, so Codex was not exercised on the project's default provider.
+127.8 s. A second, identical plain-CLI run took 214.9 s, and the recovered Codex rollouts show ~13 s per model turn:
+the gap is 12 extra turns spent on Windows-sandbox failures, not Kodevra overhead (3-5 s). See
+`docs/CODEX_PERFORMANCE.md`. The remaining four scenarios were rate-limited by the ChatGPT account after that, so
+no pass rate is claimed, and the `<= 90 s` target is not claimed either. The local DeepSeek proxy was down, so Codex
+was not exercised on the project's default provider.
+
+What Kodevra now adds around Codex (no agent loop, no Codex patching): a pre-flight run of the same `--verify`
+command feeding a one-line `<kodevra_context>` facts block (`lib/packet.js`, `--no-context` for the baseline), and a
+phase table (`lib/timings.js`) printed for Codex runs and stored as `outcome.timing.phases_ms`. The packet is one
+line because a Windows `.cmd` shim truncates a prompt at the first newline.
 
 ## Codex limitations
 

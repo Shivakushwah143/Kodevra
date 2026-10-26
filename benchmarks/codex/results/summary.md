@@ -1,6 +1,6 @@
 # Kodevra Codex harness benchmark
 
-Generated: 2026-10-26T05:50:06.205Z
+Generated: 2026-10-26T06:27:55.284Z
 Requested model (both variants): `openai/gpt-5.6-terra`
 Machine: win32/x64, Node 24.13.1
 Codex CLI: `0.149.1` (KODEVRA_CODEX_BIN)
@@ -27,13 +27,13 @@ Codex CLI: `0.149.1` (KODEVRA_CODEX_BIN)
 
 ## What each variant did
 
-- `kodevra`: `kodevra run --engine codex --verify <task verify> --executor host` - the Codex adapter, Kodevra's verification gate, bounded repair (2) and a normalised outcome file (`--outcome`).
+- `kodevra`: `kodevra run --engine codex --verify <task verify> --executor host` - the Codex adapter, a pre-flight run of the same verification command feeding a workspace-facts block into Codex's prompt, Kodevra's verification gate, bounded repair (2) and a normalised outcome file (`--outcome`). `--no-context` removes the facts block for an A/B baseline.
 - `codex-cli`: the official `codex exec --sandbox workspace-write --json` with the same prompt, model and starting repository, and no Kodevra involvement.
 - Both are judged afterwards by the same hidden acceptance test, copied in only after the agent stops.
 
 ## Fairness notes
 
-- Same model id, same task prompt (Kodevra does not prepend a workspace hint for Codex; `-C` anchors the run), same starting repository, same acceptance test.
+- Same model id, same task text, same starting repository, same acceptance test. The task text is byte-identical in both variants; the kodevra variant adds a one-line `<kodevra_context>` block of measured facts (root, file list, the pre-flight result of the same verify command, shell notes), and `--no-context` runs the earlier, context-free baseline.
 - Every repository is reset from its fixture before a run, and its own git root is created under the system temp directory.
 - The fixture directory is hashed before and after; a run that touches a fixture is rejected as `fixture_tampered` instead of scored.
 - A Kodevra PASS requires both its own verification and the hidden acceptance test to pass. Plain Codex gets one attempt; Kodevra may run up to two repairs, so a Kodevra win can reflect the repair loop rather than the harness.
@@ -44,5 +44,5 @@ Codex CLI: `0.149.1` (KODEVRA_CODEX_BIN)
 
 - A single machine, one date and one model: this is a reproducibility harness, not a claim of superiority.
 - Plain Codex gets no `--verify` loop, so the comparison measures the whole Kodevra path (gate + repair + outcome) against the raw CLI, not the two harnesses' reasoning in isolation.
-- Kodevra's `--verify` runs the task suite inside the run and the runner runs it again with the hidden test; Kodevra's recorded duration therefore includes one extra suite run.
+- Kodevra's `--verify` runs the task suite inside the run and the runner runs it again with the hidden test; Kodevra's recorded duration therefore includes one extra suite run, plus the pre-flight run when `--context` is on.
 

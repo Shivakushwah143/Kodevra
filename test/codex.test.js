@@ -228,3 +228,34 @@ test("the effective Codex model is only the selection when Codex can honour it",
   });
   assert.equal(pinned.model, "gpt-5.6-terra");
 });
+
+test("timed lines carry at_ms evidence for the first command, edit and event", () => {
+  const lines = [
+    { line: '{"type":"thread.started","thread_id":"01abc"}', at: 900 },
+    {
+      line: '{"type":"item.completed","item":{"type":"command_execution","command":"Get-ChildItem","aggregated_output":"denied","exit_code":1,"status":"failed"}}',
+      at: 1_850,
+    },
+    {
+      line: '{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"src/invoice.js"}],"status":"completed"}}',
+      at: 61_400,
+    },
+    { line: '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}', at: 120_000 },
+  ];
+
+  const events = parseCodexEvents(lines);
+
+  assert.equal(events.firstEventAt, 900);
+  assert.equal(events.commands[0].at_ms, 1_850);
+  assert.equal(events.fileChanges[0].at_ms, 61_400);
+  assert.equal(events.turnCompletedAt, 120_000);
+  assert.equal(events.turnCompleted, true);
+});
+
+test("an untimed parse stays exactly as it was, with no at_ms keys", () => {
+  const events = parseCodexEvents('{"type":"item.completed","item":{"type":"command_execution","command":"npm test","exit_code":0,"status":"completed"}}');
+
+  assert.equal("at_ms" in events.commands[0], false);
+  assert.equal(events.firstEventAt, null);
+  assert.equal(events.turnCompletedAt, null);
+});

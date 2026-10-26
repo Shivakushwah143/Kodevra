@@ -87,6 +87,10 @@ test("file metadata speaks for workspaces git cannot see", () => {
   fs.writeFileSync(path.join(dir, "src", "a.js"), "one\n", "utf8");
   const baseline = snapshotTree(dir);
 
+  // The snapshot is size + mtime metadata. Windows records file times in ~15.6ms
+  // ticks, so a same-length rewrite inside one tick is invisible to it - wait
+  // past a tick, which is what a real agent edit always is.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
   fs.writeFileSync(path.join(dir, "src", "a.js"), "two\n", "utf8");
   fs.writeFileSync(path.join(dir, "src", "b.js"), "new\n", "utf8");
 
