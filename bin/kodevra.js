@@ -14,7 +14,7 @@ import {
 } from "../lib/config.js";
 import { streamEngine } from "../lib/engine.js";
 import { classifyFailure, describeFailure } from "../lib/failures.js";
-import { writePermissionOverlay } from "../lib/permissions.js";
+import { unavailableTools, writePermissionOverlay } from "../lib/permissions.js";
 import { createVerificationAuthorization, authorizationDrift, renewAuthorization } from "../lib/authorization.js";
 import { listExecutors, resolveExecutor } from "../lib/executors.js";
 import { probeDocker } from "../lib/docker-executor.js";
@@ -544,9 +544,14 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
   for (const entry of phaseMarks) events.emit("phase", entry);
   const markNow = (name, extra = {}) => events.emit("phase", phaseMark(name, extra));
 
+  // A tool this run can never execute is not offered to the model: OpenCode's
+  // native per-agent `tools` map removes it from the request instead of rejecting
+  // the call after the model has already spent a turn on it.
+  const hiddenTools = unavailableTools({ agent: mode.agent });
+
   let scope;
   try {
-    scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec, modelConfig });
+    scope = writePermissionOverlay({ workspace, mode: mode.name, sandboxExec, modelConfig, hiddenTools });
   } catch (error) {
     console.error(color.red(error.message));
     if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
@@ -574,6 +579,11 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     for (const warning of scope.warnings) console.log(`  ${color.yellow("scope  ")} ${warning}`);
   }
   console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; shell needs approval")}`);
+  if (hiddenTools) {
+    console.log(
+      `  ${color.dim("tools  ")} bash hidden on agent ${hiddenTools.agent} ${color.dim("absent from the model's tool set (no shell in this run)")}`,
+    );
+  }
   console.log(`${color.dim("kodevra")} ${color.dim("->")} opencode ${visibleArgs(buildArgs(opts, engineModel(selection), workspace)).join(" ")}`);
   console.log(`${color.dim("mode   ")} ${mode.name} ${color.dim(`- ${mode.description}`)}`);
   if (opts.autoExplicit && opts.auto) {
@@ -596,6 +606,7 @@ async function executeRun({ engine, opts, workspace, model, selection, assessmen
     sandboxed: executor.sandboxed,
     image: executorInfo?.image ?? null,
     sandbox_exec: sandboxExec,
+    hidden_tools: hiddenTools ? [`${hiddenTools.agent}:bash`] : [],
     verify: opts.verify ?? null,
   });
 

@@ -9,6 +9,7 @@ import {
   assertCredentialFree,
   assertTrustedProject,
   clearProjectRootCache,
+  unavailableTools,
   permissionOverlay,
   projectExtensions,
   projectRoot,
@@ -181,6 +182,33 @@ test("the project root is resolved once per process, and can be re-resolved", ()
 
   clearProjectRootCache();
   assert.equal(projectRoot(nested), fs.realpathSync.native(nested));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a tool that cannot execute is removed from the overlay, not just denied", () => {
+  const dir = tempRepo();
+  // Headless runs have no approver, so bash can never execute.
+  assert.deepEqual(unavailableTools({ agent: "build", env: {} }), { agent: "build", tools: { bash: false } });
+  assert.deepEqual(unavailableTools({ agent: "plan", env: {} }), { agent: "plan", tools: { bash: false } });
+  assert.equal(unavailableTools({ agent: "build", env: { KODEVRA_HIDE_TOOLS: "0" } }), null);
+
+  const overlay = writePermissionOverlay({
+    workspace: dir,
+    mode: "workspace-write",
+    hiddenTools: unavailableTools({ agent: "build", env: {} }),
+    env: { PATH: process.env.PATH },
+  });
+  const data = JSON.parse(fs.readFileSync(overlay.file, "utf8"));
+  // The per-agent map is the only layer that reaches the request in 1.18.30; a
+  // top-level `tools` map resolves but is dropped before the model sees it.
+  assert.deepEqual(data.agent, { build: { tools: { bash: false } } });
+  assert.equal(data.tools, undefined);
+  assert.equal(data.permission.bash, "ask", "the permission layer is unchanged");
+  overlay.cleanup();
+
+  const without = writePermissionOverlay({ workspace: dir, mode: "workspace-write", env: { PATH: process.env.PATH } });
+  assert.equal(JSON.parse(fs.readFileSync(without.file, "utf8")).agent, undefined);
+  without.cleanup();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

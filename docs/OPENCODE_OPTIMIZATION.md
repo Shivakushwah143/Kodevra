@@ -306,3 +306,61 @@ kodevra run --no-doctor -m openrouter/openai/gpt-5.6-terra \
 
 `--reasoning high` is a deliberate choice for coding, not a measured optimum here (see limitations).
 `--output-tokens` only matters for aggregators, where the reservation is what the balance must cover.
+
+## 8. Third pass — the tool the model should never see
+
+A headless run has nobody to approve a shell, so `bash` could only ever be denied. The model still
+received it, spent a turn on it, and the run ended with one failed tool call.
+
+### Why the obvious switch did nothing
+
+OpenCode 1.18.30 accepts a top-level `tools` map, and it resolves:
+
+```
+$ OPENCODE_CONFIG=<overlay with "tools": {"bash": false}> opencode debug config
+tools: {"websearch":false,"webfetch":false,"bash":false}
+$ ... opencode debug agent build
+tools: {...,"bash":false,...}
+```
+
+The request the provider receives still contains it, but only in one shape. Measured by pointing a
+`@ai-sdk/openai-compatible` provider at a local server that records the `tools` array of every
+request, then running `opencode run --agent build --format json --pure`:
+
+| Config carrying bash:false | Where the provider came from | Tools in the request |
+| --- | --- | --- |
+| top-level `tools` | same config file | **bash absent** |
+| top-level `tools` | another config layer (global / project) | bash present |
+| `agent.build.tools` | another config layer | **bash absent** |
+
+So permissions and tool exposure are separate mechanisms, and the agent layer is the one that reaches
+the request: the run executes `--agent build`, and the tool set is built from that agent's resolved
+config. A resolved top-level value is not evidence - it never reaches the model when the provider is
+configured elsewhere, which is exactly Kodevra's shape (the overlay must not carry provider options or
+keys).
+
+### What changed
+
+`lib/permissions.js` now writes `agent.<run agent>.tools.bash = false` into the same run overlay, and
+`bin/kodevra.js` passes the agent the run will use (`plan` for read-only, `build` otherwise). The
+permission block is unchanged: `bash` stays `"ask"`, so a tool that leaks back through another config
+layer is still rejected. `KODEVRA_HIDE_TOOLS=0` restores the old exposure for one run.
+
+Verified end to end through `kodevra run` itself, with the same capture server as the provider:
+
+```
+$ kodevra run --no-doctor --executor host -m probe/m "say hi"
+  tools   bash hidden on agent build - absent from the model's tool set (no shell in this run)
+TOOLS: edit,glob,grep,read,skill,task,todowrite,webfetch,write
+
+$ KODEVRA_HIDE_TOOLS=0 kodevra run ... 
+TOOLS: bash,edit,glob,grep,read,skill,task,todowrite,webfetch,write
+```
+
+### Not yet measured
+
+The step/time A/B on the slugify fixture could not be re-run: every configured provider was
+unavailable at the time (OpenRouter free quota exhausted, `opencode` key expired, `deepseek` returning
+a provider error, ChatGPT plan refusing the catalog models, local FreeDeepseekAPI not running). The
+last real run on that fixture, taken before this fix, was 5 steps / 6 tool calls / 1 failed `bash`.
+The claim this change supports is only the one it proves: the model no longer has `bash` to call.
