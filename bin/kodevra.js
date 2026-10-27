@@ -950,11 +950,29 @@ async function executeRun({
       console.log(`  ${color.dim("chatgpt")} waiting for ChatGPT...${turn}`);
     } else if (event.type === "action") {
       const verb =
-        { read: "Reading", write: "Writing", edit: "Editing", list: "Listing", search: "Searching", verify: "Verifying", finish: "Finishing" }[
-          event.action
-        ] || event.action;
+        {
+          read: "Reading",
+          write: "Writing",
+          edit: "Editing",
+          list: "Listing",
+          search: "Searching",
+          inspect: "Inspecting",
+          shell: "Running",
+          apply_patch: "Patching",
+          batch: "Batching",
+          verify: "Verifying",
+          finish: "Finishing",
+        }[event.action] || event.action;
       const subject =
-        event.action === "search" ? `"${event.query}"${event.path ? ` in ${event.path}` : ""}` : event.path ? `${event.path}...` : "...";
+        event.action === "search"
+          ? `"${event.query}"${event.path ? ` in ${event.path}` : ""}`
+          : event.action === "shell"
+            ? trim(event.command || "command", 100)
+            : event.action === "inspect"
+              ? `"${event.focus || "repository"}"`
+              : event.path
+                ? `${event.path}...`
+                : "...";
       console.log(`  ${color.dim("chatgpt")} ${verb} ${subject}`);
     } else if (event.type === "tool" && !event.ok) {
       console.log(`  ${color.yellow("tool   ")} ${event.action} failed: ${trim(event.detail || "error", 120)}`);
