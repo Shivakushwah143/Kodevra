@@ -142,6 +142,7 @@ ${color.bold("Options")}
                               advertised priority service tier for this run
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
       --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
+      --max-turns <n>         ChatGPT-web only: turns one task may use (default: 8, ceiling: ${LIMITS.maxTurnCeiling})
       --reasoning <level>     reasoning effort passed to OpenCode (--variant); validated against the
                               model catalog, e.g. low | medium | high | xhigh
       --output-tokens <n>     cap the model's output budget for this run (OpenCode model limit);
@@ -209,6 +210,7 @@ const VALUE_FLAGS = new Set([
   "--speed",
   "--verify",
   "--max-repairs",
+  "--max-turns",
   "-s",
   "--session",
   "--executor",
@@ -269,6 +271,7 @@ function parse(argv) {
     speed: "default",
     verify: null,
     maxRepairs: 2,
+    maxTurns: null,
     session: null,
     continueSession: false,
     executor: null,
@@ -336,7 +339,16 @@ function parse(argv) {
     else if (arg === "--speed") opts.speed = argv[(index += 1)];
     else if (arg === "--verify") opts.verify = argv[(index += 1)];
     else if (arg === "--max-repairs") opts.maxRepairs = Number(argv[(index += 1)]);
-    else if (arg === "-s" || arg === "--session") opts.session = argv[(index += 1)];
+    else if (arg === "--max-turns") {
+      // A budget the user typed must be the budget that runs. Refuse values the
+      // loop cannot honour instead of silently falling back to the default.
+      const raw = argv[(index += 1)];
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < 1 || value > LIMITS.maxTurnCeiling) {
+        throw new Error(`--max-turns needs a whole number from 1 to ${LIMITS.maxTurnCeiling}; got "${raw ?? ""}".`);
+      }
+      opts.maxTurns = value;
+    } else if (arg === "-s" || arg === "--session") opts.session = argv[(index += 1)];
     else if (arg === "-c" || arg === "--continue") opts.continueSession = true;
     else if (arg === "--executor") {
       opts.executor = argv[(index += 1)] || "host";
@@ -597,6 +609,9 @@ async function executeRun({
   const beforeTree = snapshotTree(workspace);
   timings.mark("workspace_scan");
   const maxRepairs = Number.isFinite(opts.maxRepairs) ? Math.max(0, Math.min(5, opts.maxRepairs)) : 2;
+  // The ChatGPT-web turn budget is per run and already validated against the
+  // finite ceiling in parse(); a plain run ignores it entirely.
+  const webTurns = opts.maxTurns ?? LIMITS.maxTurns;
   const mode = resolveMode(opts);
   const agentTimeoutMs = opts.agentTimeoutMs ?? Number(process.env.KODEVRA_RUN_TIMEOUT_MS || 1_800_000);
   const agentIdleMs = opts.agentIdleMs ?? Number(process.env.KODEVRA_RUN_IDLE_MS || 300_000);
@@ -931,7 +946,7 @@ async function executeRun({
 
   const printWebEvent = (event) => {
     if (event.type === "waiting") {
-      const turn = event.turn ? color.dim(` (turn ${event.turn}/${LIMITS.maxTurns})`) : "";
+      const turn = event.turn ? color.dim(` (turn ${event.turn}/${webTurns})`) : "";
       console.log(`  ${color.dim("chatgpt")} waiting for ChatGPT...${turn}`);
     } else if (event.type === "action") {
       const verb =
@@ -961,6 +976,7 @@ async function executeRun({
       verify: opts.verify ? () => runWebVerification(attempt) : null,
       continueSession: Boolean(opts.continueSession || opts.session) && attempt === 0,
       sessionId: webSession,
+      limits: { ...LIMITS, maxTurns: webTurns },
       onEvent: printWebEvent,
     });
     if (result.session) {
@@ -2006,6 +2022,15 @@ async function main() {
       );
       process.exit(2);
     }
+  } else if (opts.maxTurns !== null) {
+    // Only the ChatGPT-web controller has a turn budget Kodevra owns; the
+    // engine drives its own loop, so the flag would be silently ignored.
+    console.error(
+      `${color.red("--max-turns belongs to --provider chatgpt-web.")} ${color.dim(
+        "The engine manages its own turns.",
+      )}`,
+    );
+    process.exit(2);
   }
   const webBridge = chatGptWeb ? bridgeSettings() : null;
   timings.mark("selection");

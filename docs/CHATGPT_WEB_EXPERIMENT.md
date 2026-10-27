@@ -76,6 +76,9 @@ that is not one valid action gets exactly one correction message; a second failu
 - `--mode read-only` refuses `write`/`edit` instead of applying them.
 - Defaults: 8 model turns, 1 protocol repair, 2 verification repairs, 24 KB per read, 40 search results,
   200 list entries, 12 KB per tool result. Exhausting a budget fails the run with an explicit code.
+- The turn budget is per run and adjustable: `--max-turns <n>` accepts 1-40, so a complex task can use
+  20 turns while the hard ceiling keeps the browser loop finite. Values outside that range are refused
+  before the run starts rather than silently clamped.
 - Verification stays Kodevra-owned: `--verify` is authorized before the run, and a successful verification
   is reused only while the workspace has not been edited since. Any later edit forces the gate to run again.
 - A new run starts a fresh ChatGPT conversation (`newSession`). `kodevra run -c` reuses the conversation
