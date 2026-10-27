@@ -85,6 +85,7 @@ import {
   writeWebSession,
 } from "../lib/chatgpt-web.js";
 import { runChatGptWebAgent } from "../lib/chatgpt-web-agent.js";
+import { APPROVAL_MODES, DEFAULT_APPROVAL_MODE, normalizeApprovalMode } from "../lib/approval-policy.js";
 import {
   PRESET_KEYS,
   activeSelection,
@@ -143,6 +144,8 @@ ${color.bold("Options")}
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
       --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
       --max-turns <n>         ChatGPT-web only: turns one task may use (default: 8, ceiling: ${LIMITS.maxTurnCeiling})
+      --approval <mode>       ChatGPT-web only: ${APPROVAL_MODES.join(" | ")} (default: ${DEFAULT_APPROVAL_MODE})
+                              strict needs approval for execution-surface changes; autonomous is for disposable workspaces
       --reasoning <level>     reasoning effort passed to OpenCode (--variant); validated against the
                               model catalog, e.g. low | medium | high | xhigh
       --output-tokens <n>     cap the model's output budget for this run (OpenCode model limit);
@@ -211,6 +214,7 @@ const VALUE_FLAGS = new Set([
   "--verify",
   "--max-repairs",
   "--max-turns",
+  "--approval",
   "-s",
   "--session",
   "--executor",
@@ -272,6 +276,7 @@ function parse(argv) {
     verify: null,
     maxRepairs: 2,
     maxTurns: null,
+    approval: null,
     session: null,
     continueSession: false,
     executor: null,
@@ -339,6 +344,7 @@ function parse(argv) {
     else if (arg === "--speed") opts.speed = argv[(index += 1)];
     else if (arg === "--verify") opts.verify = argv[(index += 1)];
     else if (arg === "--max-repairs") opts.maxRepairs = Number(argv[(index += 1)]);
+    else if (arg === "--approval") opts.approval = argv[(index += 1)] || null;
     else if (arg === "--max-turns") {
       // A budget the user typed must be the budget that runs. Refuse values the
       // loop cannot honour instead of silently falling back to the default.
@@ -980,6 +986,36 @@ async function executeRun({
       console.log(`  ${color.yellow("protocol")} ${event.reason}; sending one correction`);
     } else if (event.type === "verify_result" && !event.ok) {
       console.log(`  ${color.yellow("repair ")} verification failed (exit ${event.status ?? "?"}); the result went back to ChatGPT`);
+    } else if (event.type === "verification_state" && ["verification_passed", "verification_failed", "repair_needed", "refused", "terminal_failed"].includes(event.state)) {
+      const attempt = event.attempt ? ` · attempt ${event.attempt}` : "";
+      const trigger = event.trigger ? ` (${event.trigger})` : "";
+      console.log(`  ${color.dim("verify  ")} ${event.state}${attempt}${trigger}`);
+    } else if (event.type === "checkpoint") {
+      console.log(
+        `  ${color.dim("checkpt ")} ${event.label} · ${event.files} file(s) · ${event.git ? "git metadata" : "file metadata"}`,
+      );
+      // The checkpoint record itself is metadata; it belongs in the run log.
+      events.emit("checkpoint", {
+        label: event.label,
+        at: event.at,
+        files: event.files,
+        git: event.git,
+        rollback: event.rollback,
+      });
+    } else if (event.type === "approval_policy") {
+      // Every policy decision is logged, allow included; only refusals print.
+      events.emit("approval_policy", {
+        action: event.action,
+        decision: event.decision,
+        policy: event.policy,
+        kind: event.kind,
+        reason: event.reason,
+      });
+      if (event.decision !== "allow") {
+        console.log(`  ${color.yellow("policy  ")} ${event.action} ${event.decision} (${event.policy}): ${trim(event.reason, 100)}`);
+      }
+    } else if (event.type === "finish_blocked") {
+      console.log(`  ${color.yellow("verify  ")} finish blocked: ${event.code}`);
     } else if (event.type === "finish") {
       console.log(`  ${color.dim("chatgpt")} finished: ${trim(event.summary || "(no summary)", 120)}`);
     }
@@ -994,7 +1030,12 @@ async function executeRun({
       verify: opts.verify ? () => runWebVerification(attempt) : null,
       continueSession: Boolean(opts.continueSession || opts.session) && attempt === 0,
       sessionId: webSession,
-      limits: { ...LIMITS, maxTurns: webTurns },
+      verifyCommand: opts.verify ?? null,
+      approval: normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE,
+      provider: selection.provider,
+      model: selection.model,
+      fingerprint: authorization?.fingerprint ?? null,
+      limits: { ...LIMITS, maxTurns: webTurns, maxVerifyRepairs: maxRepairs },
       onEvent: printWebEvent,
     });
     if (result.session) {
@@ -2040,14 +2081,20 @@ async function main() {
       );
       process.exit(2);
     }
-  } else if (opts.maxTurns !== null) {
-    // Only the ChatGPT-web controller has a turn budget Kodevra owns; the
-    // engine drives its own loop, so the flag would be silently ignored.
+  } else if (opts.maxTurns !== null || opts.approval !== null) {
+    // Only the ChatGPT-web controller has a turn budget and an approval policy
+    // Kodevra owns; the engine has its own loop and permission system.
+    const flag = opts.maxTurns !== null ? "--max-turns" : "--approval";
     console.error(
-      `${color.red("--max-turns belongs to --provider chatgpt-web.")} ${color.dim(
-        "The engine manages its own turns.",
+      `${color.red(`${flag} belongs to --provider chatgpt-web.`)} ${color.dim(
+        "The engine manages its own turns and permissions.",
       )}`,
     );
+    process.exit(2);
+  }
+  if (opts.approval !== null && !normalizeApprovalMode(opts.approval)) {
+    console.error(`${color.red(`Unknown approval mode "${opts.approval}".`)} Use: ${APPROVAL_MODES.join(" | ")}`);
+    console.error(`  ${color.dim("Autonomy is opt-in; Kodevra never widens it silently.")}`);
     process.exit(2);
   }
   const webBridge = chatGptWeb ? bridgeSettings() : null;

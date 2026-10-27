@@ -20,7 +20,8 @@
     "doctor": "node bin/kodevra.js doctor",
     "smoke": "node bin/kodevra.js run --workspace examples/agent-smoke --verify \"npm test\" \"Find the failing test, fix the implementation in src/slugify.js without touching the test, then stop.\"",
     "benchmark": "node benchmarks/runner.js",
-    "benchmark:codex": "node benchmarks/codex/runner.js"
+    "benchmark:codex": "node benchmarks/codex/runner.js",
+    "benchmark:harness": "node benchmarks/harness/runner.js"
   },
   "engines": {
     "node": ">=20"
