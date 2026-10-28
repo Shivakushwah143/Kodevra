@@ -15,7 +15,7 @@ import {
 import { streamEngine } from "../lib/engine.js";
 import { classifyFailure, describeFailure } from "../lib/failures.js";
 import { unavailableTools, writePermissionOverlay } from "../lib/permissions.js";
-import { createVerificationAuthorization, authorizationDrift, renewAuthorization } from "../lib/authorization.js";
+import { createVerificationAuthorization, authorizationDrift, renewAgentSurface, renewAuthorization } from "../lib/authorization.js";
 import { listExecutors, resolveExecutor } from "../lib/executors.js";
 import { probeDocker } from "../lib/docker-executor.js";
 import { watchRunEvents } from "../lib/progress.js";
@@ -142,7 +142,8 @@ ${color.bold("Options")}
       --speed <mode>          default | fast - Codex only; fast selects Codex's
                               advertised priority service tier for this run
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
-      --max-repairs <n>       bounded repair runs after a failed verification (default: 2)
+      --max-repairs <n>       bounded repairs after a failed verification (default: 2);
+                              ChatGPT-web counts repeated failures against the same edits
       --max-turns <n>         ChatGPT-web only: turns one task may use (default: 8, ceiling: ${LIMITS.maxTurnCeiling})
       --approval <mode>       ChatGPT-web only: ${APPROVAL_MODES.join(" | ")} (default: ${DEFAULT_APPROVAL_MODE})
                               strict needs approval for execution-surface changes; autonomous is for disposable workspaces
@@ -157,8 +158,9 @@ ${color.bold("Options")}
                               on by default for run --engine codex)
   -c, --continue              continue the last session
   -s, --session <id>          continue a specific session
-      --executor <name>       where project commands run: host | docker (default: host)
-                              docker also enables the trusted sandbox_exec tool for the agent
+      --executor <name>       where project commands run: host | docker (default: host,
+                              or docker when --verify is available). Applies to --verify and
+                              to the ChatGPT-web shell; docker also enables sandbox_exec for OpenCode
       --reapprove <sha256>    renew host-execution authorization for that exact changed
                               surface (the fingerprint is printed when it refuses)
       --timeout <seconds>     wall-clock limit for one agent call (default 1800)
@@ -626,19 +628,27 @@ async function executeRun({
   let executorInfo = null;
   try {
     executor = resolveExecutor(opts.executor || (opts.verify ? defaultVerifyExecutor() : "host"));
-    if (opts.verify && executor.check) executorInfo = await executor.check();
+    if ((opts.verify || (chatGptWeb && executor.name === "docker")) && executor.check) {
+      executorInfo = await executor.check();
+    }
   } catch (error) {
     console.error(color.red(error.message));
     if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
-    console.error(`  ${color.dim("No verification ran, and Kodevra did not fall back to the host executor.")}`);
+    console.error(
+      `${color.dim(
+        chatGptWeb && executor?.name === "docker"
+          ? "No task was started: the selected executor is unavailable and Kodevra will not fall back to the host."
+          : "No verification ran, and Kodevra did not fall back to the host executor.",
+      )}`,
+    );
     process.exit(2);
   }
   phaseMark("executor_ready", { executor: executor.name, checked: Boolean(executorInfo) });
 
-  // Model-requested shell only exists inside the Docker sandbox, and only for
-  // OpenCode: Codex brings its own sandbox and does not load OpenCode tools.
-  // The experimental ChatGPT-web loop has no engine tools at all, so there is
-  // nothing for a sandbox_exec tool to attach to.
+  // sandbox_exec is an OpenCode tool, so it only exists for OpenCode runs with
+  // the Docker executor. Codex brings its own sandbox; the ChatGPT-web loop has
+  // no engine tools at all, and its `shell` action runs through this same
+  // executor directly instead of attaching a tool.
   const sandboxExec = harness === "opencode" && executor.name === "docker" && !chatGptWeb;
   let sandboxTool = null;
   if (sandboxExec) {
@@ -729,7 +739,10 @@ async function executeRun({
     for (const warning of scope.warnings) console.log(`  ${color.yellow("scope  ")} ${warning}`);
   }
   if (chatGptWeb) {
-    console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim("- file tools confined here; no shell in this run")}`);
+    const shellScope = executor.sandboxed
+      ? `shell follows --executor ${executor.name} (ephemeral snapshot; shell changes are discarded)`
+      : "shell runs on the host against the workspace (not sandboxed)";
+    console.log(`  ${color.dim("scope  ")} ${workspace} ${color.dim(`- file tools confined here; ${shellScope}`)}`);
   } else if (harness === "codex") {
     if (codexTarget.note) console.log(`  ${color.yellow("model  ")} ${codexTarget.note}`);
     console.log(
@@ -787,6 +800,7 @@ async function executeRun({
     image: executorInfo?.image ?? null,
     sandbox_exec: sandboxExec,
     hidden_tools: hiddenTools ? [`${hiddenTools.agent}:bash`] : [],
+    shell_executor: chatGptWeb ? executor.name : null,
     verify: opts.verify ?? null,
   });
   events.emit("speed_selected", codexSpeed ?? { requested: "default", effective_service_tier: null });
@@ -912,9 +926,45 @@ async function executeRun({
       : null
     : null;
   let webState = null;
+  let webReauthorizations = 0;
 
-  const runWebVerification = async (attempt) => {
+  const runWebVerification = async (attempt, { changedFiles = [], approval: requestedApproval = null } = {}) => {
     let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
+    if (!gate.ok && !gate.fingerprintMismatch) {
+      // Test/config work is normal coding. Under balanced/autonomous policy the
+      // agent's own test-surface edits are re-authorized; manifests, lockfiles
+      // and anything else still need the developer (or strict mode).
+      const renewal = renewAgentSurface({
+        authorization,
+        drift: gate.drift,
+        workspace,
+        command: opts.verify,
+        approval: requestedApproval ?? normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE,
+        changedFiles,
+        renewals: webReauthorizations,
+      });
+      if (renewal.ok && renewal.renewed) {
+        authorization = renewal.authorization;
+        webReauthorizations += 1;
+        gate = { ok: true };
+        events.emit("verification_reauthorized", {
+          command: opts.verify,
+          policy: requestedApproval ?? normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE,
+          changed: renewal.drift.changed,
+          added: renewal.drift.added,
+          removed: renewal.drift.removed,
+          fingerprint: authorization.fingerprint,
+          source: authorization.source,
+        });
+        console.log(
+          `  ${color.dim("gate    ")} test surface re-authorized by the agent ${color.dim(
+            `· ${renewal.drift.changed.length + renewal.drift.added.length + renewal.drift.removed.length} file(s) · sha256 ${authorization.fingerprint.slice(0, 12)}`,
+          )}`,
+        );
+      } else if (renewal.reason) {
+        events.emit("verification_reauthorization_refused", { command: opts.verify, reason: renewal.reason });
+      }
+    }
     if (!gate.ok) {
       approval = {
         required: true,
@@ -951,7 +1001,11 @@ async function executeRun({
   };
 
   const printWebEvent = (event) => {
-    if (event.type === "waiting") {
+    if (event.type === "bootstrap") {
+      console.log(
+        `  ${color.dim("context ")} gathered locally in ${event.ms} ms · ${event.chars} chars${event.detail ? color.dim(` · ${trim(event.detail, 80)}`) : ""}`,
+      );
+    } else if (event.type === "waiting") {
       const turn = event.turn ? color.dim(` (turn ${event.turn}/${webTurns})`) : "";
       console.log(`  ${color.dim("chatgpt")} waiting for ChatGPT...${turn}`);
     } else if (event.type === "action") {
@@ -980,6 +1034,34 @@ async function executeRun({
                 ? `${event.path}...`
                 : "...";
       console.log(`  ${color.dim("chatgpt")} ${verb} ${subject}`);
+    } else if (event.type === "subagent") {
+      const focus = event.focus ? ` "${trim(event.focus, 80)}"` : "";
+      if (event.phase === "start") {
+        console.log(
+          `  ${color.dim("subagent")} ${event.role}${focus} starting (invocation ${event.invocation}/${LIMITS.subagentInvocations})`,
+        );
+      } else {
+        const state = event.ok ? color.green("done") : color.yellow(event.code || "failed");
+        const summary = event.summary ? ` · ${trim(event.summary, 100)}` : "";
+        console.log(
+          `  ${color.dim("subagent")} ${event.role} ${state} · ${event.turns} turn(s) · ${(
+            event.durationMs / 1000
+          ).toFixed(1)}s · ${event.total} total${summary}`,
+        );
+      }
+      // Subagent telemetry rides the existing run log; H8 reads the same data.
+      events.emit("subagent", {
+        role: event.role,
+        phase: event.phase,
+        ok: event.phase === "finish" ? Boolean(event.ok) : null,
+        code: event.code ?? null,
+        duration_ms: event.durationMs ?? null,
+        turns: event.turns ?? null,
+        invocation: event.invocation,
+        total: event.total ?? null,
+        focus: event.focus ?? null,
+        summary: event.summary ?? null,
+      });
     } else if (event.type === "tool" && !event.ok) {
       console.log(`  ${color.yellow("tool   ")} ${event.action} failed: ${trim(event.detail || "error", 120)}`);
     } else if (event.type === "protocol_error") {
@@ -1027,7 +1109,7 @@ async function executeRun({
       task: taskText,
       mode: mode.name,
       chat: (message) => chatTurn({ ...message, settings: bridge }),
-      verify: opts.verify ? () => runWebVerification(attempt) : null,
+      verify: opts.verify ? (info) => runWebVerification(attempt, info ?? {}) : null,
       continueSession: Boolean(opts.continueSession || opts.session) && attempt === 0,
       sessionId: webSession,
       verifyCommand: opts.verify ?? null,
@@ -1035,6 +1117,7 @@ async function executeRun({
       provider: selection.provider,
       model: selection.model,
       fingerprint: authorization?.fingerprint ?? null,
+      executor,
       limits: { ...LIMITS, maxTurns: webTurns, maxVerifyRepairs: maxRepairs },
       onEvent: printWebEvent,
     });
@@ -1090,11 +1173,13 @@ async function executeRun({
         events.emit("failure", { code: failure.code, origin: failure.origin, message: failure.message });
         events.emit("verification_skipped", { reason: "the chatgpt-web loop stopped" });
       }
+      const subagentTotal = webState.harness?.subagents?.total ?? 0;
+      const economy = webState.harness?.economy ?? null;
       console.log(
         `  ${color.dim("chatgpt")} ${webState.turns} turn(s) · ${webState.actions.length} action(s) · ${(
           (webState.endedAt - webState.startedAt) /
           1000
-        ).toFixed(1)}s`,
+        ).toFixed(1)}s${economy ? ` · ${economy.localOperations} local op(s)` : ""}${subagentTotal ? ` · ${subagentTotal} subagent(s)` : ""}`,
       );
     } else {
       run = await runAgent(
@@ -1143,7 +1228,9 @@ async function executeRun({
       if (last && !last.refused) {
         verification = last;
       } else if (!last) {
-        const result = await runWebVerification(0);
+        const result = await runWebVerification(0, {
+          changedFiles: webState?.harness?.context?.changedFiles ?? [],
+        });
         if (!result.refused) verification = result;
       }
     } else if (opts.verify && !failure) {
@@ -1301,7 +1388,9 @@ async function executeRun({
     failure,
     approval: approval ? { ...approval, required: true } : null,
     changes,
-    repairs,
+    // A ChatGPT-web repair is a real failed verification against changed files,
+    // not the number of model patches.
+    repairs: chatGptWeb ? (webState?.harness?.economy?.failedVerifications ?? repairs) : repairs,
     maxRepairs,
     executor,
     authorization,
@@ -1311,6 +1400,8 @@ async function executeRun({
     codex: codexEvidence,
     speed: codexSpeed,
     timings: timings.toJSON(),
+    subagents: webState?.harness?.subagents ?? null,
+    economy: webState?.harness?.economy ?? null,
   });
   timings.mark("total");
   outcome.timing.phases_ms = timings.toJSON();

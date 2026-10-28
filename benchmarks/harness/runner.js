@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { normalizeApprovalMode } from "../../lib/approval-policy.js";
+import { createVerificationAuthorization } from "../../lib/authorization.js";
 import { runChatGptWebAgent } from "../../lib/chatgpt-web-agent.js";
 import {
   CHATGPT_WEB_MODEL,
@@ -226,6 +227,15 @@ async function main() {
     }
 
     const limits = { ...LIMITS, maxTurns, maxVerifyRepairs: maxRepairs };
+    // Same authorization source as `kodevra run --verify`: the fingerprint of the
+    // verification surface the run is actually started against, so benchmark
+    // checkpoints record a real execution fingerprint instead of null.
+    let authorization = null;
+    try {
+      authorization = createVerificationAuthorization({ workspace: task.workspace, command: task.verify });
+    } catch (error) {
+      if (!opts.quiet) console.warn(`  warning: no execution fingerprint (${error.code || error.message})`);
+    }
     const startedAt = Date.now();
     let result;
     try {
@@ -236,6 +246,7 @@ async function main() {
         provider: CHATGPT_WEB_PROVIDER,
         model: CHATGPT_WEB_MODEL,
         verifyCommand: task.verify,
+        fingerprint: authorization?.fingerprint ?? null,
         limits,
         chat: (message) => chatTurn({ ...message, settings }),
         verify: () => runVerification({ command: task.verify, workspace: task.workspace, timeoutMs: task.timeoutMs }),
