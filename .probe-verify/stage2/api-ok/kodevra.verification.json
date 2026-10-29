@@ -1,0 +1,1 @@
+{"acceptance":[{"id":"health","kind":"api","path":"/health","expect":{"status":200,"jsonField":"ok","jsonValue":true}}]}

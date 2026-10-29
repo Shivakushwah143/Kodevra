@@ -16,6 +16,8 @@ import { streamEngine } from "../lib/engine.js";
 import { classifyFailure, describeFailure } from "../lib/failures.js";
 import { unavailableTools, writePermissionOverlay } from "../lib/permissions.js";
 import { createVerificationAuthorization, authorizationDrift, renewAgentSurface, renewAuthorization } from "../lib/authorization.js";
+import { deriveContract, summarizeContract } from "../lib/verification-contract.js";
+import { captureContractBaseline, runContractVerification } from "../lib/verification-runner.js";
 import { listExecutors, resolveExecutor } from "../lib/executors.js";
 import { probeDocker } from "../lib/docker-executor.js";
 import { watchRunEvents } from "../lib/progress.js";
@@ -142,6 +144,8 @@ ${color.bold("Options")}
       --speed <mode>          default | fast - Codex only; fast selects Codex's
                               advertised priority service tier for this run
       --verify <command>      run this command after the task; its exit code decides PASS/FAIL
+      --runtime, --no-runtime  after --verify passes, prove the built software actually runs
+                              (runtime adapter + acceptance; default: on)
       --max-repairs <n>       bounded repairs after a failed verification (default: 2);
                               ChatGPT-web counts repeated failures against the same edits
       --max-turns <n>         ChatGPT-web only: turns one task may use (default: 8, ceiling: ${LIMITS.maxTurnCeiling})
@@ -163,8 +167,13 @@ ${color.bold("Options")}
                               to the ChatGPT-web shell; docker also enables sandbox_exec for OpenCode
       --reapprove <sha256>    renew host-execution authorization for that exact changed
                               surface (the fingerprint is printed when it refuses)
-      --timeout <seconds>     wall-clock limit for one agent call (default 1800)
-      --idle-timeout <secs>   cancel an agent call with no output for this long (default 300)
+      --timeout <seconds>     wall-clock limit for one agent call (default 1800);
+                              for --provider chatgpt-web it is the model-turn deadline
+                              (one hour when omitted), enforced by polling a durable
+                              bridge request, never by one long HTTP connection
+      --idle-timeout <secs>   cancel an agent call with no output for this long (default 300);
+                              chatgpt-web ignores it: a browser reasoning silently is not
+                              idle, and its turn is bounded by --timeout
       --events-json           stream structured execution events to stderr
       --outcome <file>        write the normalised run outcome as JSON to this file
   -y, --yes                   accept the setup plan without prompting (init)
@@ -276,6 +285,7 @@ function parse(argv) {
     mode: null,
     speed: "default",
     verify: null,
+    runtime: true,
     maxRepairs: 2,
     maxTurns: null,
     approval: null,
@@ -345,6 +355,8 @@ function parse(argv) {
     else if (arg === "--mode") opts.mode = argv[(index += 1)];
     else if (arg === "--speed") opts.speed = argv[(index += 1)];
     else if (arg === "--verify") opts.verify = argv[(index += 1)];
+    else if (arg === "--no-runtime") opts.runtime = false;
+    else if (arg === "--runtime") opts.runtime = true;
     else if (arg === "--max-repairs") opts.maxRepairs = Number(argv[(index += 1)]);
     else if (arg === "--approval") opts.approval = argv[(index += 1)] || null;
     else if (arg === "--max-turns") {
@@ -487,7 +499,8 @@ async function proxyReachableIfLocal(provider) {
  * matches what the command would execute. If the agent changed scripts, test
  * files or their configuration, execution stops until the developer approves
  * *that exact surface* by naming its fingerprint. A bare flag cannot approve
- * changes nobody has seen yet.
+ * changes nobody has seen yet. Autonomous runs rebind their own edits first (see
+ * renewAgentSurface); strict and balanced still stop here.
  */
 function verificationGate({ authorization, workspace, command, reapprove }) {
   const drift = authorizationDrift(authorization, { workspace, command });
@@ -510,17 +523,44 @@ function printApproval(approval) {
   }
 }
 
-async function runVerificationWithEvents({ executor, command, workspace, events, attempt }) {
+async function runVerificationWithEvents({ executor, command, workspace, events, attempt, contract = null, includeRuntime = true }) {
   events.emit("verification_started", {
     command,
     executor: executor.name,
     sandboxed: executor.sandboxed,
     attempt,
+    contract: contract
+      ? { project: contract.project.kind, gates: contract.repository.map((gate) => gate.command) }
+      : null,
   });
   console.log(`\n  ${color.dim("verify ")} ${command}`);
   let result;
   try {
-    result = await executor.run(command, { cwd: workspace });
+    // The contract runs cheapest-first and returns the same result shape the
+    // single-command path returns; only its evidence is richer.
+    result = contract
+      ? await runContractVerification({
+          contract,
+          workspace,
+          executor,
+          includeRuntime,
+          onGate: (gate) => {
+            events.emit("verification_gate", {
+              id: gate.id,
+              layer: gate.layer,
+              ok: Boolean(gate.ok),
+              skipped: Boolean(gate.skipped),
+              blocking: Boolean(gate.blocking),
+              status: gate.status ?? null,
+              code: gate.code ?? null,
+              duration_ms: gate.durationMs ?? null,
+              attempt,
+            });
+            const state = gate.skipped ? color.dim("skip") : gate.ok ? color.green("pass") : color.red("fail");
+            console.log(`  ${color.dim("gate  ")} ${gate.layer}:${gate.id} ${color.dim(trim(gate.command ?? "", 64))} -> ${state}`);
+          },
+        })
+      : await executor.run(command, { cwd: workspace });
   } catch (error) {
     result = {
       command,
@@ -549,6 +589,9 @@ async function runVerificationWithEvents({ executor, command, workspace, events,
     snapshot: result.details?.snapshot ?? null,
     staged_files: result.details?.staged_files ?? null,
     error: result.error ?? null,
+    contract: result.contract
+      ? { project: result.contract.project?.kind ?? null, verdict: result.verdict ?? null, failed: result.failedGates ?? [] }
+      : null,
   });
   return result;
 }
@@ -620,6 +663,10 @@ async function executeRun({
   // The ChatGPT-web turn budget is per run and already validated against the
   // finite ceiling in parse(); a plain run ignores it entirely.
   const webTurns = opts.maxTurns ?? LIMITS.maxTurns;
+  // For chatgpt-web this is the model-turn deadline, not an HTTP timeout: the
+  // durable transport submits a turn and polls briefly, so --timeout bounds how
+  // long the model may take rather than how long a socket may stay silent.
+  const webTurnDeadlineMs = opts.agentTimeoutMs ?? LIMITS.turnTimeoutMs;
   const mode = resolveMode(opts);
   const agentTimeoutMs = opts.agentTimeoutMs ?? Number(process.env.KODEVRA_RUN_TIMEOUT_MS || 1_800_000);
   const agentIdleMs = opts.agentIdleMs ?? Number(process.env.KODEVRA_RUN_IDLE_MS || 300_000);
@@ -828,6 +875,46 @@ async function executeRun({
       source: authorization.source,
     });
   }
+
+  // ---- verification contract ------------------------------------------------
+  // Derived locally from the workspace, once, before implementation starts, then
+  // frozen for the run: repository gates, one runtime adapter, and any acceptance
+  // criteria from workspace configuration. The model is never asked what kind of
+  // project this is and cannot weaken the contract later.
+  let contract = null;
+  if (opts.verify) {
+    try {
+      contract = deriveContract({ workspace, verifyCommand: opts.verify, runtime: opts.runtime !== false });
+    } catch (error) {
+      console.error(`  ${color.yellow("contract")} could not be derived: ${error.message}`);
+      contract = null;
+    }
+    if (contract) {
+      if (contract.repository.some((gate) => gate.cheap)) {
+        // Cheap static analysers only, run before mutation, so a failure that was
+        // already there is never blamed on this run.
+        const captured = await captureContractBaseline({ contract, workspace, executor });
+        if (captured.baseline) contract.baseline = captured.baseline;
+      }
+      const runtimeLabel = contract.runtime
+        ? `${contract.runtime.adapter}${contract.runtime.mode === "static" ? " (static)" : ""}`
+        : "none";
+      const baselineFailures = Object.entries(contract.baseline?.gates ?? {})
+        .filter(([, entry]) => !entry.ok)
+        .map(([id]) => id);
+      console.log(
+        `  ${color.dim("contract")} ${contract.project.kind} · ${contract.repository.length} repository gate(s) · runtime ${runtimeLabel}${
+          contract.acceptance.length ? ` · ${contract.acceptance.length} acceptance` : ""
+        }${baselineFailures.length ? color.yellow(` · baseline failures: ${baselineFailures.join(", ")}`) : ""}`,
+      );
+      for (const warning of contract.warnings) console.log(`  ${color.yellow("contract")} ${warning}`);
+      events.emit("verification_contract", {
+        ...summarizeContract(contract),
+        runtime_enabled: opts.runtime !== false,
+      });
+      timings.mark("contract");
+    }
+  }
   console.log("");  // Pre-flight + workspace facts for Codex. One extra run of the verification
   // command, *before* the agent starts, turns "the tests fail somewhere" into
   // evidence the model can act on, instead of something it has to rediscover a
@@ -929,17 +1016,19 @@ async function executeRun({
   let webReauthorizations = 0;
 
   const runWebVerification = async (attempt, { changedFiles = [], approval: requestedApproval = null } = {}) => {
+    const policy = requestedApproval ?? normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE;
     let gate = verificationGate({ authorization, workspace, command: opts.verify, reapprove: opts.reapprove });
     if (!gate.ok && !gate.fingerprintMismatch) {
-      // Test/config work is normal coding. Under balanced/autonomous policy the
-      // agent's own test-surface edits are re-authorized; manifests, lockfiles
-      // and anything else still need the developer (or strict mode).
+      // Test/config work is normal coding. Balanced re-authorizes the agent's own
+      // test-surface edits; autonomous also re-authorizes manifests, lockfiles and
+      // build config this run created, because the workspace was empty when the
+      // command was authorized. Strict still needs the developer.
       const renewal = renewAgentSurface({
         authorization,
         drift: gate.drift,
         workspace,
         command: opts.verify,
-        approval: requestedApproval ?? normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE,
+        approval: policy,
         changedFiles,
         renewals: webReauthorizations,
       });
@@ -949,7 +1038,7 @@ async function executeRun({
         gate = { ok: true };
         events.emit("verification_reauthorized", {
           command: opts.verify,
-          policy: requestedApproval ?? normalizeApprovalMode(opts.approval) ?? DEFAULT_APPROVAL_MODE,
+          policy,
           changed: renewal.drift.changed,
           added: renewal.drift.added,
           removed: renewal.drift.removed,
@@ -957,7 +1046,7 @@ async function executeRun({
           source: authorization.source,
         });
         console.log(
-          `  ${color.dim("gate    ")} test surface re-authorized by the agent ${color.dim(
+          `  ${color.dim("gate    ")} ${policy === "autonomous" ? "surface" : "test surface"} re-authorized by the agent ${color.dim(
             `· ${renewal.drift.changed.length + renewal.drift.added.length + renewal.drift.removed.length} file(s) · sha256 ${authorization.fingerprint.slice(0, 12)}`,
           )}`,
         );
@@ -995,19 +1084,95 @@ async function executeRun({
         fingerprint: authorization.fingerprint,
       });
     }
-    const result = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt });
+    const result = await runVerificationWithEvents({
+      executor,
+      command: opts.verify,
+      workspace,
+      events,
+      attempt,
+      contract,
+      includeRuntime: opts.runtime !== false,
+    });
     timings.mark("verification");
     return result;
   };
 
+  const formatWebElapsed = (ms) => {
+    const total = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+    const minutes = Math.floor(total / 60);
+    const seconds = total % 60;
+    return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+  };
+
+  // Live display of the streamed response. The durable answer still prints
+  // nowhere else: this state only mirrors text so a long turn is visible while
+  // it happens, and it is always closed before any ordinary status line.
+  let webStreamOpen = false;
+  let webStreamLength = 0;
+  const closeWebStream = () => {
+    if (!webStreamOpen) return;
+    process.stdout.write("\n");
+    webStreamOpen = false;
+  };
+  const writeWebDelta = (text) => {
+    if (!text) return;
+    if (!webStreamOpen) {
+      process.stdout.write(`  ${color.dim("chatgpt >")} `);
+      webStreamOpen = true;
+    }
+    process.stdout.write(text);
+  };
+  const printWebStreamEvent = (event) => {
+    if (event.stream === "response.started") {
+      closeWebStream();
+      webStreamLength = 0;
+      return;
+    }
+    if (event.stream === "response.delta") {
+      let delta = `${event.delta ?? ""}`;
+      if (!delta) return;
+      // Resume from what the terminal already shows: a reconnect can replay an
+      // overlapping delta, but it must never repeat text on screen.
+      const answerLength = Math.max(0, Number(event.answerLength) || 0);
+      if (answerLength > 0) {
+        const start = answerLength - delta.length;
+        if (start < webStreamLength) delta = delta.slice(webStreamLength - start);
+        else if (start > webStreamLength) delta = "";
+      }
+      if (!delta) return;
+      writeWebDelta(delta);
+      webStreamLength += delta.length;
+      return;
+    }
+    if (event.stream === "response.completed" || event.stream === "response.recovering") closeWebStream();
+  };
+
   const printWebEvent = (event) => {
-    if (event.type === "bootstrap") {
+    if (event.type !== "stream") closeWebStream();
+    if (event.type === "stream") {
+      printWebStreamEvent(event);
+    } else if (event.type === "bootstrap") {
       console.log(
         `  ${color.dim("context ")} gathered locally in ${event.ms} ms · ${event.chars} chars${event.detail ? color.dim(` · ${trim(event.detail, 80)}`) : ""}`,
       );
     } else if (event.type === "waiting") {
       const turn = event.turn ? color.dim(` (turn ${event.turn}/${webTurns})`) : "";
       console.log(`  ${color.dim("chatgpt")} waiting for ChatGPT...${turn}`);
+    } else if (event.type === "progress") {
+      // A long turn reports its state, not every poll: the transport throttles.
+      const turn = event.turn ? color.dim(` · turn ${event.turn}/${webTurns}`) : "";
+      const request = event.requestId ? color.dim(` · request ${String(event.requestId).slice(0, 8)}`) : "";
+      if (event.stage === "submitted") {
+        console.log(`  ${color.dim("chatgpt")} submitted${request}${turn}`);
+      } else if (event.stage === "recovering") {
+        console.log(`  ${color.yellow("chatgpt")} recovering browser connection · ${formatWebElapsed(event.elapsedMs)}${request}${turn}`);
+      } else if (event.stage === "received") {
+        console.log(`  ${color.dim("chatgpt")} response received · ${formatWebElapsed(event.elapsedMs)}${turn}`);
+      } else if (event.stage === "legacy") {
+        console.log(`  ${color.yellow("chatgpt")} bridge has no durable turn endpoint; using the synchronous /v1 path`);
+      } else {
+        console.log(`  ${color.dim("chatgpt")} waiting · ${formatWebElapsed(event.elapsedMs)}${request}${turn}`);
+      }
     } else if (event.type === "action") {
       const verb =
         {
@@ -1108,7 +1273,7 @@ async function executeRun({
       workspace,
       task: taskText,
       mode: mode.name,
-      chat: (message) => chatTurn({ ...message, settings: bridge }),
+      chat: (message) => chatTurn({ ...message, settings: bridge, timeoutMs: webTurnDeadlineMs }),
       verify: opts.verify ? (info) => runWebVerification(attempt, info ?? {}) : null,
       continueSession: Boolean(opts.continueSession || opts.session) && attempt === 0,
       sessionId: webSession,
@@ -1257,7 +1422,15 @@ async function executeRun({
             fingerprint: authorization.fingerprint,
           });
         }
-        verification = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt: 0 });
+        verification = await runVerificationWithEvents({
+          executor,
+          command: opts.verify,
+          workspace,
+          events,
+          attempt: 0,
+          contract,
+          includeRuntime: opts.runtime !== false,
+        });
         timings.mark("verification");
         let signature = failureSignature(verification.output);
 
@@ -1336,7 +1509,15 @@ async function executeRun({
             });
           }
 
-          verification = await runVerificationWithEvents({ executor, command: opts.verify, workspace, events, attempt: repairs });
+          verification = await runVerificationWithEvents({
+            executor,
+            command: opts.verify,
+            workspace,
+            events,
+            attempt: repairs,
+            contract,
+            includeRuntime: opts.runtime !== false,
+          });
           const next = failureSignature(verification.output);
           if (!verification.ok && next === signature) {
             console.log(`\n  ${color.yellow("stopped")} the same failure repeated; no progress after ${repairs} repair run(s).`);

@@ -368,7 +368,7 @@ test("tool results are bounded and labelled", () => {
   assert.match(truncated, /\[truncated\]/);
 });
 
-test("the bridge transport posts the message and reads the assistant text", async () => {
+test("the synchronous bridge transport posts the message and reads the assistant text", async () => {
   const captured = [];
   const fetchImpl = async (url, options) => {
     captured.push({ url, options, body: JSON.parse(options.body) });
@@ -380,9 +380,12 @@ test("the bridge transport posts the message and reads the assistant text", asyn
       { status: 200, headers: { "content-type": "application/json" } },
     );
   };
+  // The synchronous contract is the fallback for a bridge without the durable
+  // endpoint; it still has to post the same request and read the same answer.
   const reply = await chatTurn({
     message: "hello",
     newSession: true,
+    durable: false,
     settings: { baseURL: "http://127.0.0.1:8080/v1", token: "t0ken" },
     fetchImpl,
   });

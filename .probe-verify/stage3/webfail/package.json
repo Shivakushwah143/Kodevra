@@ -1,0 +1,1 @@
+{"name":"w","scripts":{"build":"node -e 0"},"dependencies":{"vite":"^5"}}

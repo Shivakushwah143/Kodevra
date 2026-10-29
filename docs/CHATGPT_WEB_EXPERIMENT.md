@@ -48,6 +48,48 @@ kodevra doctor -p chatgpt-web          # one readiness question: bridge up, brow
 `-p chatgpt-web` is only valid for `run` and `doctor`. It is never the default and cannot be combined with
 `--engine codex`.
 
+## Turn transport: durable, not one long request
+
+A ChatGPT answer can take four minutes or forty. Holding one HTTP request open for it is what made the run
+fail: Node's `fetch` (Undici) closes a silent connection after about 300 seconds whatever `AbortSignal` says,
+so a 316-second answer arrived at the bridge and was reported to Kodevra as `fetch failed`. Raising a timeout
+constant could never fix that, because the limit lived below the request.
+
+Kodevra therefore submits a turn and polls its state:
+
+```
+Kodevra -> POST /kodevra/requests  { prompt, model, sessionId, idempotency_key, deadline_ms }
+         <- 202 { request_id, status }            (returns immediately)
+Kodevra -> GET  /kodevra/requests/:id            (short request, every ~2.5s)
+         <- pending | submitted | waiting_for_model | recovering | completed | failed | cancelled
+```
+
+The bridge owns the persisted request and runs the turn through its existing browser machinery, so canonical
+recovery, tab leases and transient retries are unchanged. Kodevra's `--timeout` is the model-turn deadline,
+not a socket timeout; `turnTimeoutMs` is only that deadline's default. `/health` keeps its 5-second probe.
+
+Rules the transport enforces:
+
+- **Idempotency.** Every turn carries a stable key (run + turn number). A retried submit - network drop,
+  bridge restart, ambiguous timeout - returns the existing request instead of asking ChatGPT twice. A key
+  reused for a different prompt is refused with `409`, never overwritten.
+- **One logical turn, many short requests.** No individual HTTP operation waits for model reasoning, so no
+  transport default can truncate it and `--timeout 3600` really means an hour.
+- **Recovery is a wait.** A tab that reconnects reports `recovering`; the turn stays alive. Only the
+  configured deadline or a terminal bridge error ends it.
+- **Bridge restart does not replay.** Non-terminal requests found on disk after a restart are closed as
+  unrecoverable (`BRIDGE_RESTART_UNRECOVERABLE` -> `MODEL_RECOVERY_FAILED`) rather than resubmitted, because
+  the prompt may already be in the tab.
+- **Distinct failures.** A refused localhost port is `BRIDGE_UNAVAILABLE`; an expired configured deadline is
+  `MODEL_RESPONSE_TIMEOUT`; a failed canonical recovery is `MODEL_RECOVERY_FAILED`; anything the browser
+  finished with an error is `MODEL_REQUEST_FAILED`. Evidence includes the `request_id`.
+- **Quiet output.** The terminal prints a line when the state changes and otherwise at most once a minute:
+  `submitted`, `waiting · 3m 40s`, `recovering browser connection`, `response received · 8m 12s`.
+
+The OpenAI-compatible `/v1/chat/completions` route is unchanged for other consumers. A bridge without the
+durable endpoint is detected (`404`) and Kodevra falls back to that synchronous path, saying so once - that
+fallback is the only remaining code whose duration is capped by the HTTP transport.
+
 ## Text action protocol
 
 ChatGPT returns exactly one JSON object per turn; nothing else.
@@ -112,9 +154,12 @@ that is not one valid action gets exactly one correction message; a second failu
   before the run starts rather than silently clamped.
 - Verification stays Kodevra-owned: `--verify` is authorized before the run, and a successful verification
   is reused only while the workspace has not been edited since. Any later edit forces the gate to run again.
-- Test files and test-runner config may be changed by the agent. Under balanced/autonomous policy Kodevra
+- Test files and test-runner config may be changed by the agent. Under balanced policy Kodevra
   re-authorizes that test surface (bounded, with a `verification_reauthorized` event in the run log);
   strict runs and manifest/lockfile changes still require an explicit `--reapprove <fingerprint>`.
+- Under `--approval autonomous` the run also re-authorizes manifests, lockfiles, build config and scripts it
+  changed itself, so an empty workspace can gain `package.json` and then run `npm run build` without stopping
+  for `--reapprove`. Surface drift this run did not report is still refused.
 - A new run starts a fresh ChatGPT conversation (`newSession`). `kodevra run -c` reuses the conversation
   recorded for that workspace in `~/.kodevra/chatgpt-web-sessions.json` (an opaque id only).
 

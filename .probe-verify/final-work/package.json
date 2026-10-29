@@ -1,0 +1,1 @@
+{"name":"final","scripts":{"build":"node build.js","typecheck":"node check.js"},"dependencies":{"vite":"^5"}}
