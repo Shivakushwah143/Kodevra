@@ -79,7 +79,6 @@ import {
   CHATGPT_WEB_MODEL,
   CHATGPT_WEB_PROVIDER,
   LIMITS,
-  bridgeSettings,
   chatGptWebAssessment,
   chatTurn,
   probeBridge,
@@ -87,6 +86,9 @@ import {
   writeWebSession,
 } from "../lib/chatgpt-web.js";
 import { runChatGptWebAgent } from "../lib/chatgpt-web-agent.js";
+import { ensureChatGptBridge, resolveBridgeInstallation } from "../lib/bridge-supervisor.js";
+import { runInteractiveSession } from "../lib/interactive.js";
+import { runSetup } from "../lib/setup.js";
 import { APPROVAL_MODES, DEFAULT_APPROVAL_MODE, normalizeApprovalMode } from "../lib/approval-policy.js";
 import {
   PRESET_KEYS,
@@ -111,8 +113,15 @@ import { buildWorkspacePacket, withWorkspacePacket } from "../lib/packet.js";
 const PROCESS_STARTED_AT = Date.now();
 
 const USAGE = `${color.bold("Usage")}
-  kodevra [path]              start the agent in a workspace (default: current directory)
+  kodevra                     open the Kodevra prompt in the current directory
+  kodevra "<task>"            run a task immediately in the current directory
+  kodevra [path]              launch the agent in an existing workspace
   kodevra run "<task>"        run one task headlessly (workspace-write by default)
+  kodevra --provider chatgpt-web "<task>"
+                              run once through ChatGPT Web (Kodevra starts the bridge)
+  kodevra --provider deepseek "<task>"
+                              run once through DeepSeek
+  kodevra setup               one-time environment, provider and bridge setup
   kodevra run "<task>" --verify "npm test"
                               run a task, then let a real command decide PASS/FAIL
   kodevra sessions            list the local sessions for this workspace
@@ -120,6 +129,7 @@ const USAGE = `${color.bold("Usage")}
   kodevra init                apply Kodevra defaults (DeepSeek provider, Gemini output cap)
   kodevra providers           list providers, credentials and default models
   kodevra providers use <p>   select a provider for future runs (Kodevra state only)
+                              includes chatgpt-web and freedeepseek
   kodevra providers current   show the active provider/model
   kodevra providers models <p>  real model ids from the provider itself
   kodevra engines             list execution engines and their readiness
@@ -135,7 +145,8 @@ const USAGE = `${color.bold("Usage")}
 
 ${color.bold("Options")}
   -w, --workspace <path>      workspace to run in
-  -p, --provider <key>        provider for this run (default: ${DEFAULT_PROVIDER})
+  -p, --provider <key>        provider for this run (default: saved choice, then ${DEFAULT_PROVIDER})
+      --bridge-dir <path>     chatgpt-bridge checkout for kodevra setup
   -m, --model <provider/model>  default: ${DEFAULT_PROVIDER}/${DEFAULT_MODEL_ID}
       --engine <name>         execution engine: opencode (default) | codex
       --agent <name>          OpenCode agent to use (default: build, or plan in read-only)
@@ -219,6 +230,7 @@ const VALUE_FLAGS = new Set([
   "--model",
   "-p",
   "--provider",
+  "--bridge-dir",
   "--agent",
   "--mode",
   "--speed",
@@ -240,6 +252,7 @@ const VALUE_FLAGS = new Set([
 const COMMANDS = new Set([
   "doctor",
   "init",
+  "setup",
   "run",
   "help",
   "version",
@@ -271,7 +284,11 @@ function modeAuto(opts, name) {
 function parse(argv) {
   const opts = {
     command: "launch",
+    commandExplicit: false,
+    implicit: false,
     workspace: process.cwd(),
+    workspaceExplicit: false,
+    bridgeDir: null,
     model: null,
     provider: null,
     engine: null,
@@ -322,16 +339,19 @@ function parse(argv) {
     const token = arg === "provider" ? "providers" : arg;
     if (COMMANDS.has(token)) {
       opts.command = token;
+      opts.commandExplicit = true;
       commandIndex = index;
       break;
     }
     const resolved = path.resolve(arg);
     if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
       opts.workspace = resolved;
+      opts.workspaceExplicit = true;
       commandIndex = index;
       continue;
     }
-    throw new Error(`Unknown command or directory: ${arg}`);
+    // Free text is a task, not an error: `kodevra "fix the login bug"` is the
+    // normal entry point and the current directory is already the workspace.
   }
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -339,9 +359,13 @@ function parse(argv) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") opts.help = true;
     else if (arg === "-v" || arg === "--version") opts.command = "version";
-    else if (arg === "-w" || arg === "--workspace") opts.workspace = path.resolve(argv[(index += 1)] || "");
+    else if (arg === "-w" || arg === "--workspace") {
+      opts.workspace = path.resolve(argv[(index += 1)] || "");
+      opts.workspaceExplicit = true;
+    }
     else if (arg === "-m" || arg === "--model") opts.model = argv[(index += 1)];
     else if (arg === "-p" || arg === "--provider") opts.provider = argv[(index += 1)];
+    else if (arg === "--bridge-dir") opts.bridgeDir = path.resolve(argv[(index += 1)] || "");
     else if (arg === "--engine") opts.engine = argv[(index += 1)];
     else if (arg === "--outcome") opts.outcome = argv[(index += 1)];
     else if (arg === "--agent") opts.agent = argv[(index += 1)];
@@ -389,6 +413,14 @@ function parse(argv) {
       break;
     } else if (arg.startsWith("-")) opts.passthrough.push(arg);
     else opts.message.push(arg);
+  }
+
+  if (!opts.commandExplicit) {
+    // A bare prompt or a free-text task is the Zero-Batch entry point. An
+    // explicit workspace path stays the legacy launcher: `kodevra <path>` is
+    // still a direct engine launch, not a new prompt.
+    opts.implicit = !opts.workspaceExplicit;
+    if (opts.command === "launch" && opts.message.length) opts.command = "run";
   }
 
   return opts;
@@ -1618,7 +1650,7 @@ async function executeRun({
   });
   for (const line of lines) console.log(line);
 
-  process.exit(ok ? 0 : 1);
+  return ok ? 0 : 1;
 }
 
 function start(engine, args, workspace, env = process.env, hint = "Try: npm i -g opencode-ai") {
@@ -2324,6 +2356,15 @@ async function main() {
     process.exit(result.ok || result.cancelled ? 0 : 1);
   }
 
+  if (opts.command === "setup") {
+    const code = await runSetup({
+      requestedProvider: opts.provider,
+      bridgeDir: opts.bridgeDir,
+      yes: opts.yes,
+    });
+    process.exit(code);
+  }
+
   if (opts.command === "engines") {
     await enginesCommand(opts, engine);
     return;
@@ -2345,10 +2386,10 @@ async function main() {
       process.exit(2);
     }
     selection.model = CHATGPT_WEB_MODEL;
-    if (opts.command !== "run" && opts.command !== "doctor") {
+    if (!["run", "launch", "doctor", "providers", "auth"].includes(opts.command)) {
       console.error(
-        `${color.red("--provider chatgpt-web is only available for kodevra run.")} ${color.dim(
-          "It drives a browser tab; there is no interactive engine session behind it.",
+        `${color.red("--provider chatgpt-web does not support this command.")} ${color.dim(
+          "Use kodevra, kodevra \"<task>\", kodevra run, doctor, providers or auth.",
         )}`,
       );
       process.exit(2);
@@ -2369,7 +2410,9 @@ async function main() {
     console.error(`  ${color.dim("Autonomy is opt-in; Kodevra never widens it silently.")}`);
     process.exit(2);
   }
-  const webBridge = chatGptWeb ? bridgeSettings() : null;
+  let webBridge = chatGptWeb
+    ? resolveBridgeInstallation({ cwd: path.resolve(opts.workspace) }).settings
+    : null;
   timings.mark("selection");
   // Provider assessment exists for OpenCode's credential and model plumbing. A
   // Codex run only needs it for the unsupported-provider guard and the plan, yet
@@ -2527,7 +2570,17 @@ async function main() {
       : assessment.ready
         ? `${assessment.state} · ${assessment.credential.source}`
         : `${assessment.state} · ${assessment.detail}`;
-  const activeMode = opts.command === "run" || opts.command === "launch" ? `${mode.name} - ${mode.description}` : null;
+  const interactiveSession = opts.command === "launch" && (opts.implicit || chatGptWeb);
+  // A bare prompt defaults to workspace-write, but an explicit --mode still
+  // wins; the panel should describe the mode the tasks will really use.
+  const interactiveMode = opts.mode
+    ? `${mode.name} - ${mode.description}`
+    : "workspace-write - edits allowed in this workspace";
+  const activeMode = interactiveSession
+    ? interactiveMode
+    : opts.command === "run" || opts.command === "launch"
+      ? `${mode.name} - ${mode.description}`
+      : null;
 
   if (opts.command === "providers") {
     if ((opts.message[0] || "list").toLowerCase() === "list") {
@@ -2554,7 +2607,7 @@ async function main() {
       sandbox: sandboxStatusLine(executorNameForDisplay(opts)),
       mode: activeMode,
       engine: chatGptWeb ? "chatgpt-bridge" : harness,
-      hints: opts.command === "launch" || opts.command === "run",
+      hints: !opts.implicit && (opts.command === "launch" || opts.command === "run"),
     }),
   );
 
@@ -2564,6 +2617,39 @@ async function main() {
     console.log(
       `  ${color.dim("Protocol")} one JSON action per turn ${color.dim("- ChatGPT has no native tool calls on this path")}`,
     );
+
+    // The panel is printed before a process is started, so the first line a user
+    // sees is Kodevra, not a child process log. Doctor never starts the bridge.
+    if (opts.command === "run" || opts.command === "launch") {
+      try {
+        const bridge = await ensureChatGptBridge({
+          workspace,
+          bridgeDir: opts.bridgeDir,
+          onStatus: (message) => console.log(`  ${color.dim("provider")} ${message}`),
+        });
+        webBridge = bridge.settings;
+      } catch (error) {
+        console.error(`\n  ${color.red("ChatGPT Web is not ready.")} ${error.message}`);
+        if (error.hint) console.error(`  ${color.yellow("->")} ${error.hint}`);
+        console.error(`  ${color.dim("Run: kodevra doctor for diagnostics.")}`);
+        // Leave through the normal exit path. `process.exit()` here can abort
+        // while the detached bridge child's stdio handles are still closing,
+        // which crashes Node on Windows (libuv UV_HANDLE_CLOSING assertion).
+        process.exitCode = 1;
+        return;
+      }
+    }
+  }
+
+  // An explicit provider is also the new preference: the next bare `kodevra`
+  // should not silently fall back to the previous one. `setup` writes the same
+  // state, so both entry points share one persistence mechanism.
+  if (opts.provider && (opts.command === "run" || opts.command === "launch")) {
+    try {
+      writeState({ provider: selection.provider, model: fullModel(selection) });
+    } catch {
+      // A read-only home directory must not prevent a run from starting.
+    }
   }
 
   if (harness === "opencode" && !chatGptWeb && (opts.command === "run" || opts.command === "launch")) {
@@ -2606,11 +2692,20 @@ async function main() {
   // nothing about that, so asking them would only invent failures.
   if (chatGptWeb) {
     const probe = await probeBridge(webBridge);
-    console.log(`  ${mark(probe.ok)}  ${color.bold("ChatGPT bridge".padEnd(18))}  ${color.dim(probe.detail)}`);
+    // The supervisor already waited for this exact condition. Keep the line for
+    // doctor and for a real failure, not as noise on every normal startup.
+    if (diagnosticsAlways || !probe.ok) {
+      console.log(`  ${mark(probe.ok)}  ${color.bold("ChatGPT bridge".padEnd(18))}  ${color.dim(probe.detail)}`);
+    }
     if (!probe.ok) {
       if (probe.hint) console.log(`  ${color.yellow("->")} ${probe.hint}`);
       timings.mark("diagnostics");
-      if (diagnosticsAlways || opts.doctor) process.exit(1);
+      if (diagnosticsAlways) process.exit(1);
+      if (opts.doctor) {
+        // As above: do not abort while a detached bridge child is closing.
+        process.exitCode = 1;
+        return;
+      }
     }
     timings.mark("diagnostics");
     phaseMark("diagnostics");
@@ -2619,7 +2714,7 @@ async function main() {
       process.exit(probe.ok ? 0 : 1);
     }
   }
-  if (!chatGptWeb && (diagnosticsAlways || (opts.doctor && process.env.KODEVRA_SKIP_DOCTOR !== "1"))) {
+  if (!chatGptWeb && (diagnosticsAlways || (opts.doctor && !opts.implicit && process.env.KODEVRA_SKIP_DOCTOR !== "1"))) {
     const result = await runDiagnostics({
       workspace,
       model,
@@ -2659,24 +2754,61 @@ async function main() {
     process.exit(1);
   }
 
+  const runSelected = async () => executeRun({
+    engine,
+    harness,
+    harnessInfo,
+    codexTarget,
+    opts,
+    workspace,
+    model,
+    selection,
+    assessment,
+    modelConfig,
+    codexSpeed,
+    speedConfig,
+    stopSpeed,
+    timings,
+    chatGptWeb,
+    bridge: webBridge,
+  });
+
   if (opts.command === "run") {
-    await executeRun({
-      engine,
-      harness,
-      harnessInfo,
-      codexTarget,
-      opts,
-      workspace,
-      model,
-      selection,
-      assessment,
-      modelConfig,
-      codexSpeed,
-      speedConfig,
-      stopSpeed,
-      timings,
-      chatGptWeb,
-      bridge: webBridge,
+    const code = await runSelected();
+    process.exit(code);
+  }
+
+  // A bare `kodevra` is a Kodevra prompt, not a second terminal framework. The
+  // same run path is used for every task, and the process stays alive for the
+  // next instruction.
+  if (opts.command === "launch" && (opts.implicit || chatGptWeb)) {
+    const priorSession = chatGptWeb ? readWebSession(workspace) : null;
+    if (chatGptWeb) {
+      opts.continueSession = Boolean(priorSession || opts.continueSession || opts.session);
+      opts.session = priorSession || opts.session;
+    }
+    await runInteractiveSession({
+      runTask: async (task) => {
+        opts.message = [task];
+        opts.command = "run";
+        opts.doctor = false;
+        if (chatGptWeb) {
+          const bridge = await ensureChatGptBridge({
+            workspace,
+            bridgeDir: opts.bridgeDir,
+            // Startup already printed the one Ready line. A later reuse should
+            // not repeat it before every task in the same prompt session.
+            onStatus: (message) => {
+              if (message !== "Ready.") console.log(`  ${color.dim("provider")} ${message}`);
+            },
+          });
+          webBridge = bridge.settings;
+          const session = readWebSession(workspace);
+          opts.continueSession = Boolean(session || opts.continueSession || opts.session);
+          opts.session = session || opts.session;
+        }
+        await runSelected();
+      },
     });
     return;
   }

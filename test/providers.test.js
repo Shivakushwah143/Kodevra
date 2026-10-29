@@ -111,6 +111,14 @@ test("liveEngineModels reports no answer when the engine cannot be run", () => {
   assert.equal(liveEngineModels(null, "openai"), null);
 });
 
+test("chatgpt-web is a selectable browser provider with its own model", () => {
+  const assessment = assessProvider("chatgpt-web", { catalog: null, config: null, authProviders: [] });
+  assert.equal(assessment.ready, true);
+  assert.equal(assessment.kind, "browser");
+  assert.equal(assessment.defaultModel, "chatgpt");
+  assert.deepEqual(assessment.models, ["chatgpt"]);
+});
+
 test("ChatGPT-plan runs drop the API key; every other selection keeps it", () => {
   const env = { OPENAI_API_KEY: "sk-not-printed", PATH: "/bin" };
 
