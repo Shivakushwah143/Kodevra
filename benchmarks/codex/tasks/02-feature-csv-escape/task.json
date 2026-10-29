@@ -1,0 +1,7 @@
+{
+  "id": "02-feature-csv-escape",
+  "title": "CSV export does not escape fields",
+  "category": "feature",
+  "prompt": "The CSV export in src/csv.js writes raw values, so any field containing a comma, a double quote, a carriage return or a newline produces a broken file. Add RFC 4180-style field escaping: quote only the fields that need it and double any internal quote. Keep the existing toCsv signature, do not add dependencies, and make the test suite pass. Do not edit the tests.",
+  "verify": "npm test"
+}

@@ -1,0 +1,94 @@
+{
+  "task": "01-bugfix-invoice-tax",
+  "title": "Invoice total ignores sales tax",
+  "category": "bug-fix",
+  "variant": "kodevra",
+  "model": "openai/gpt-5.6-terra",
+  "codex_model": "gpt-5.6-terra",
+  "codex_provider": "openai",
+  "codex_provider_mismatch": false,
+  "codex_version": "0.149.1",
+  "started_at": "2026-10-26T05:41:16.571Z",
+  "attempt": 1,
+  "session_reset": true,
+  "session_reset_detail": "no local proxy",
+  "tool_failures": null,
+  "ok": false,
+  "status": "failed",
+  "error_type": "rate_limit",
+  "error": "rate_limit",
+  "duration_ms": 24361,
+  "agent_exit": 1,
+  "agent_timed_out": false,
+  "verify_exit": 1,
+  "verify_tail": "...a-codex-bench/kodevra/01-bugfix-invoice-tax/test/invoice.test.js:11:10)\n      at Test.runInAsyncScope (node:async_hooks:214:14)\n      at Test.run (node:internal/test_runner/test:1103:25)\n      at Test.processPendingSubtests (node:internal/test_runner/test:785:18)\n      at Test.postRun (node:internal/test_runner/test:1232:19)\n      at Test.run (node:internal/test_runner/test:1160:12)\n      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {\n    generatedMessage: true,\n    code: 'ERR_ASSERTION',\n    actual: 100,\n    expected: 108.25,\n    operator: 'strictEqual',\n    diff: 'simple'\n  }\n\ntest at test\\invoice.test.js:14:1\n✖ invoice total rounds tax to cents (0.4665ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  \n  59.97 !== 64.92\n  \n      at TestContext.<anonymous> (file:///C:/Users/SHIVAK%7E1/AppData/Local/Temp/kodevra-codex-bench/kodevra/01-bugfix-invoice-tax/test/invoice.test.js:15:10)\n      at Test.runInAsyncScope (node:async_hooks:214:14)\n      at Test.run (node:internal/test_runner/test:1103:25)\n      at Test.processPendingSubtests (node:internal/test_runner/test:785:18)\n      at Test.postRun (node:internal/test_runner/test:1232:19)\n      at Test.run (node:internal/test_runner/test:1160:12)\n      at async Test.processPendingSubtests (node:internal/test_runner/test:785:7) {\n    generatedMessage: true,\n    code: 'ERR_ASSERTION',\n    actual: 59.97,\n    expected: 64.92,\n    operator: 'strictEqual',\n    diff: 'simple'\n  }\n",
+  "agent_tail": "....\n  error   You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Nov 24th, 2026 5:33 PM.\n  error   You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Nov 24th, 2026 5:33 PM.\n\n  failure RATE_LIMITED (provider) - The provider is rate-limiting or the account has no remaining quota.\n  next Wait and retry, or select another configured provider. Kodevra never retries automatically.\n  outcome C:\\Users\\SHIVAK~1\\AppData\\Local\\Temp\\kodevra-codex-bench\\kodevra\\01-bugfix-invoice-tax.outcome.json\n\n  TASK COMPLETE\n\n  Files changed    3\n  Sandbox commands 0\n  Verification     none - result is UNVERIFIED\n  Repair attempts  none\n  Duration         17.0s\n  Model            gpt-5.6-terra\n  Executor         host - runs project code directly on this machine not sandboxed\n  Authorization    developer --verify · 2 file(s) · sha256 cbfdd592de33\n\n  Changes\n  package.json\n  src/\n  test/\n  3 of these file(s) were already modified before this task\n\n  Failure          RATE_LIMITED (provider) - The provider is rate-limiting or the account has no remaining quota.\n  Next             Wait and retry, or select another configured provider. Kodevra never retries automatically.\n\n  Next             pass --verify \"<command>\" to base the result on a real exit code\n\n  Status           FAILED\n  Events           C:\\Users\\shiva kushwah\\.kodevra\\runs\\run_20261026-054123_52e67e.jsonl\n\n",
+  "files_changed": [],
+  "tokens": null,
+  "thread_id": "01a176ba-500e-76b1-a9ec-fb214d1dc740",
+  "commands": 0,
+  "failed_commands": 0,
+  "repairs": 0,
+  "provider_error": "RATE_LIMITED",
+  "outcome": {
+    "schema": "kodevra.outcome/1",
+    "harness": "codex",
+    "model": "gpt-5.6-terra",
+    "provider": "openai",
+    "status": "failed",
+    "ok": false,
+    "timing": {
+      "started_at": "2026-10-26T05:41:22.826Z",
+      "ended_at": "2026-10-26T05:41:39.818Z",
+      "duration_ms": 16992,
+      "agent_ms": 16319,
+      "verification_ms": null
+    },
+    "exit": {
+      "code": 1,
+      "signal": null,
+      "timed_out": false,
+      "timeout_reason": null
+    },
+    "error": {
+      "code": "RATE_LIMITED",
+      "origin": "provider",
+      "message": "The provider is rate-limiting or the account has no remaining quota."
+    },
+    "verification": null,
+    "authorization": {
+      "fingerprint": "cbfdd592de33b1efbe75d5ca919723f34d1a8589aac36e1b1826477715d2d29c",
+      "files": 2,
+      "source": "developer --verify"
+    },
+    "changes": {
+      "count": 3,
+      "files": [
+        "package.json",
+        "src/",
+        "test/"
+      ]
+    },
+    "repairs": {
+      "attempts": 0,
+      "max": 2
+    },
+    "evidence": {
+      "events_file": "C:\\Users\\shiva kushwah\\.kodevra\\runs\\run_20261026-054123_52e67e.jsonl",
+      "agent": {
+        "thread_id": "01a176ba-500e-76b1-a9ec-fb214d1dc740",
+        "commands": [],
+        "failed_commands": 0,
+        "file_changes": 0,
+        "messages": 1,
+        "tokens": null,
+        "turn_completed": false,
+        "turn_failed": true,
+        "errors": [
+          "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Nov 24th, 2026 5:33 PM.",
+          "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Nov 24th, 2026 5:33 PM."
+        ]
+      }
+    }
+  }
+}

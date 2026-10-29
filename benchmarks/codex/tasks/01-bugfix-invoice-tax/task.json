@@ -1,0 +1,7 @@
+{
+  "id": "01-bugfix-invoice-tax",
+  "title": "Invoice total ignores sales tax",
+  "category": "bug-fix",
+  "prompt": "invoices are undercharging: invoiceTotal never applies the sales tax rate that TAX_RATE documents. Fix the calculation in src/invoice.js so the total includes tax rounded to cents, keep the existing exports working, and make the test suite pass. Do not edit the tests.",
+  "verify": "npm test"
+}

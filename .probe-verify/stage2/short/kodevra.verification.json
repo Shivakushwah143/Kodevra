@@ -1,0 +1,1 @@
+{"repository":[{"id":"typecheck","command":"node -e process.exit(3)","required":true,"cheap":true}]}

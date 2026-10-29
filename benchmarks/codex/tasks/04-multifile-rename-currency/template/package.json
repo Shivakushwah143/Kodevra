@@ -1,0 +1,8 @@
+{
+  "name": "fixture-rename-currency",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

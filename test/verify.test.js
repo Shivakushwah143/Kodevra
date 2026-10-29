@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  clearWorkspaceChangeCache,
   failureSignature,
   repairPrompt,
   resultLines,
@@ -83,16 +84,40 @@ test("a verified run reports the real command and exit code", () => {
 
 test("file metadata speaks for workspaces git cannot see", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-tree-"));
+  const baselineAt = new Date(Date.now() - 5_000);
   fs.mkdirSync(path.join(dir, "src"));
   fs.writeFileSync(path.join(dir, "src", "a.js"), "one\n", "utf8");
+  // The snapshot compares size and mtime, so give the rewrite a later timestamp
+  // explicitly: two writes inside one system clock tick carry the same mtime on
+  // Windows, and a model run is minutes apart, never microseconds.
+  fs.utimesSync(path.join(dir, "src", "a.js"), baselineAt, baselineAt);
   const baseline = snapshotTree(dir);
 
+  // The snapshot is size + mtime metadata. Windows records file times in ~15.6ms
+  // ticks, so a same-length rewrite inside one tick is invisible to it - wait
+  // past a tick, which is what a real agent edit always is.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
   fs.writeFileSync(path.join(dir, "src", "a.js"), "two\n", "utf8");
   fs.writeFileSync(path.join(dir, "src", "b.js"), "new\n", "utf8");
+  const later = new Date();
+  fs.utimesSync(path.join(dir, "src", "a.js"), later, later);
 
   const changed = treeChangedFiles(baseline, dir);
   assert.deepEqual(changed, ["src/a.js", "src/b.js"]);
 
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("whether a workspace is a git work tree is asked once per process", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kodevra-gitprobe-"));
+  clearWorkspaceChangeCache();
+  const first = workspaceChanges(dir).isGit;
+
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  assert.equal(workspaceChanges(dir).isGit, first, "the answer is memoized for the run");
+
+  clearWorkspaceChangeCache();
+  assert.equal(workspaceChanges(dir).isGit, true, "a cleared cache asks git again");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

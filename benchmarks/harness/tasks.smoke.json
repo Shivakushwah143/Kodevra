@@ -1,0 +1,14 @@
+{
+  "name": "harness-smoke",
+  "tasks": [
+    {
+      "id": "agent-smoke-slugify",
+      "workspace": "../../examples/agent-smoke",
+      "task": "Find the failing test, fix the implementation in src/slugify.js without touching the test, then stop.",
+      "verify": "npm test",
+      "maxTurns": 20,
+      "maxRepairs": 2,
+      "approval": "balanced"
+    }
+  ]
+}

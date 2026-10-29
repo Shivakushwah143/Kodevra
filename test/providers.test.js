@@ -88,6 +88,20 @@ test("no credential means needs auth, not a guessed model", () => {
   assert.match(assessment.hint, /kodevra auth login openai/);
 });
 
+test("a config model block adds to the catalog instead of hiding it", () => {
+  // `kodevra init` writes one capped OpenRouter model into the config. That must
+  // not make the provider look like it serves only that model.
+  const assessment = assessProvider("openrouter", {
+    catalog: { openrouter: { models: { "openai/gpt-5": {}, "openai/gpt-5.6-terra": {} } } },
+    config: { provider: { openrouter: { models: { "google/gemini-3.6-flash": { limit: { output: 4096 } } } } } },
+    authProviders: [],
+  });
+
+  assert.deepEqual(assessment.models, ["google/gemini-3.6-flash", "openai/gpt-5", "openai/gpt-5.6-terra"]);
+  assert.equal(assessment.models.includes("openai/gpt-5.6-terra"), true);
+  assert.match(assessment.planSource, /engine catalog \+ opencode config/);
+});
+
 test("a live authenticated list wins over a preset preference", () => {
   assert.equal(defaultModelFor("openai", catalog), "gpt-4o");
   assert.equal(defaultModelFor("openai", catalog, ["gpt-5.4-mini", "gpt-5.5"]), "gpt-5.4-mini");
@@ -95,6 +109,14 @@ test("a live authenticated list wins over a preset preference", () => {
 
 test("liveEngineModels reports no answer when the engine cannot be run", () => {
   assert.equal(liveEngineModels(null, "openai"), null);
+});
+
+test("chatgpt-web is a selectable browser provider with its own model", () => {
+  const assessment = assessProvider("chatgpt-web", { catalog: null, config: null, authProviders: [] });
+  assert.equal(assessment.ready, true);
+  assert.equal(assessment.kind, "browser");
+  assert.equal(assessment.defaultModel, "chatgpt");
+  assert.deepEqual(assessment.models, ["chatgpt"]);
 });
 
 test("ChatGPT-plan runs drop the API key; every other selection keeps it", () => {

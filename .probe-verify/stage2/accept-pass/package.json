@@ -1,0 +1,1 @@
+{"name":"web","scripts":{"build":"node -e 0"},"dependencies":{"react":"^18"}}

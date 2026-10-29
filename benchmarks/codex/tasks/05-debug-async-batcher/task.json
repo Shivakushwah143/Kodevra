@@ -1,0 +1,7 @@
+{
+  "id": "05-debug-async-batcher",
+  "title": "Async batcher loses buffered items",
+  "category": "debugging",
+  "prompt": "Batches handed to an asynchronous flush arrive empty or incomplete: the sink records [] where it should record the items that triggered it. Reproduce the symptom with the failing test, find the race in src/batcher.js, and fix it without changing the public API (createBatcher({ flush, maxSize }) returning { add }). Do not edit the tests.",
+  "verify": "npm test"
+}
